@@ -70,6 +70,7 @@ After building the vector store, you can generate quiz questions using the `mast
   --quiz quiz.json \
   --answers answer_key.json \
   --rag-persist .chroma \
+  --rag-local \
   --rag-k 3 \
   --fresh
 ```

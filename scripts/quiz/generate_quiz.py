@@ -31,6 +31,11 @@ def print(*args, **kwargs):  # type: ignore
         args = (f"[{ts}] {args[0]}",) + args[1:]
     return _orig_print(*args, **kwargs)
 
+# --- Constants ---
+OLLAMA_URL = "http://localhost:11434/api/generate"
+DEFAULT_HTTP_TIMEOUT = 240
+VERIFY_HTTP_TIMEOUT = 90
+
 # =========================
 # Data Model
 # =========================
@@ -73,7 +78,6 @@ class Config:
     count: int
     quiz: Path
     answers: Path
-    sources: List[str]
     no_random_component: bool
     model: str
     ai: bool
@@ -147,7 +151,9 @@ def parse_args(argv: List[str]) -> Config:
     p.add_argument('--rag-k', type=int, default=4)
     p.add_argument('--rag-queries', nargs='+')
     p.add_argument('--rag-max-queries', type=int)
-    p.add_argument('--rag-local', action='store_true')
+    group = p.add_mutually_exclusive_group()
+    group.add_argument('--rag-local', dest='rag_local', action='store_true', default=True)
+    group.add_argument('--rag-openai', dest='rag_local', action='store_false')
     p.add_argument('--rag-embed-model', default='sentence-transformers/all-MiniLM-L6-v2')
     p.add_argument('--no-rag', dest='no_rag', action='store_true')
 
@@ -162,7 +168,6 @@ def parse_args(argv: List[str]) -> Config:
         count=a.count,
         quiz=Path(a.quiz),
         answers=Path(a.answers),
-        sources=a.sources,
         no_random_component=a.no_random_component,
         model=a.model,
         ai=a.ai,
@@ -598,7 +603,7 @@ class Providers:
                 pass
 
         start = time.time()
-        resp = self._requests.post('http://localhost:11434/api/generate', json=payload, timeout=240)
+        resp = self._requests.post(OLLAMA_URL, json=payload, timeout=DEFAULT_HTTP_TIMEOUT)
         if resp.status_code != 200:
             raise RuntimeError(f'Ollama HTTP {resp.status_code}: {resp.text[:200]}')
         data = resp.json()
@@ -620,6 +625,110 @@ class Providers:
 # =========================
 
 class RAG:
+    def get_blocks_for_theme(self, theme: str, k: int) -> Optional[Dict[str, str]]:
+        if not self._vs:
+            return None
+        q = theme
+        try:
+            q_slug = self._slugify(q)
+            docs = self._vs.similarity_search(q, k=k, filter={"h1": q})
+            if not docs:
+                docs = self._vs.similarity_search(q, k=k, filter={"h1": q_slug})
+            if not docs:
+                docs = self._vs.similarity_search(q, k=k)
+        except Exception as e:
+            log("warn", f"Per-question retrieval failed: {e}")
+            docs = []
+        if not docs:
+            return None
+        seen, blocks = set(), []
+        for d in docs:
+            snippet = d.page_content[:1000].strip()
+            if snippet in seen:
+                continue
+            seen.add(snippet)
+            heading = d.metadata.get('section_heading') or (snippet.split('\n',1)[0][:80])
+            source  = (d.metadata.get('source') or d.metadata.get('rel_path') or d.metadata.get('path') or 'unknown')
+            blocks.append(f"[C1] (source: {source}, heading: {heading})\n{snippet}")
+        if not blocks:
+            return None
+        header = "\n".join([
+            "# Retrieved Knowledge (Citations)",
+            f"Query: {q}",
+            "Each question MUST be grounded in one or more cited sections. Do NOT invent facts.",
+            "Guidance: Derive 'topic' from the PRIMARY cited section heading; keep it concise (1-4 words, Title Case). NEVER use 'RAG_CONTEXT'."
+        ])
+        return {'RAG_CONTEXT.md': header + "\n\n---\n\n" + "\n\n".join(blocks)}
+
+    def _fetch_unique_tags(self, db_path: str) -> List[str]:
+        """Return a sorted list of unique tag tokens (lowercased) from embedding_metadata."""
+        try:
+            conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
+            cur.execute("SELECT string_value FROM embedding_metadata WHERE key='tags';")
+            rows = cur.fetchall()
+            conn.close()
+            uniq: set[str] = set()
+            for (val,) in rows:
+                if not val:
+                    continue
+                for tok in str(val).split(','):
+                    t = tok.strip().lower()
+                    if t:
+                        uniq.add(t)
+            return sorted(uniq)
+        except Exception as e:
+            log("warn", f"Could not fetch tags: {e}")
+            return []
+
+    def get_blocks_for_tag(self, tag: str, k: int) -> Optional[Dict[str, str]]:
+        """Fetch a small per-question context constrained by a single tag."""
+        if not self._vs:
+            return None
+        q = tag.strip().lower()
+        if not q:
+            return None
+        try:
+            # Try exact/equality filter first, then fall back to similarity + post-filtering
+            docs = []
+            try:
+                docs = self._vs.similarity_search(q, k=k, filter={"tags": q})
+            except Exception:
+                docs = []
+            if not docs:
+                docs = self._vs.similarity_search(q, k=k)
+        except Exception as e:
+            log("warn", f"Per-question retrieval by tag failed: {e}")
+            docs = []
+        # Post-filter by comma-separated tags in metadata
+        kept = []
+        for d in docs:
+            md = getattr(d, 'metadata', {}) or {}
+            tline = (md.get('tags') or '').lower()
+            tag_list = [t.strip() for t in tline.split(',') if t.strip()]
+            if q in tag_list or any((q == t or q in t) for t in tag_list):
+                kept.append(d)
+        docs = kept or docs
+        if not docs:
+            return None
+        seen, blocks = set(), []
+        for d in docs:
+            snippet = d.page_content[:1000].strip()
+            if snippet in seen:
+                continue
+            seen.add(snippet)
+            heading = d.metadata.get('section_heading') or (snippet.split('\n',1)[0][:80])
+            source  = (d.metadata.get('source') or d.metadata.get('rel_path') or d.metadata.get('path') or 'unknown')
+            blocks.append(f"[C1] (source: {source}, heading: {heading})\n{snippet}")
+        if not blocks:
+            return None
+        header = "\n".join([
+            "# Retrieved Knowledge (Citations)",
+            f"Tag: {q}",
+            "Each question MUST be grounded in one or more cited sections. Do NOT invent facts.",
+            "Guidance: Derive 'topic' from the PRIMARY cited section heading; keep it concise (1-4 words, Title Case). NEVER use 'RAG_CONTEXT'."
+        ])
+        return {'RAG_CONTEXT.md': header + "\n\n---\n\n" + "\n\n".join(blocks)}
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self._vs = None
@@ -679,125 +788,24 @@ class RAG:
             return files, []
 
         db_path = os.path.join(self.cfg.rag_persist, 'chroma.sqlite3')
-        dynamic_queries = self._fetch_dynamic_h1_queries(db_path)
+        # New: collect unique tags for theme selection
+        all_tags = self._fetch_unique_tags(db_path)
 
-        filter_override = any([self.cfg.restrict_sources, self.cfg.include_tags, self.cfg.include_h1])
-        if dynamic_queries and not filter_override and not self.cfg.rag_queries:
-            rng = random.Random(self.cfg.seed)
-            selected_themes = rng.sample(dynamic_queries, min(count, len(dynamic_queries)))
-            default_queries = selected_themes
-            log("info", f"Using {len(selected_themes)} random dynamic H1 queries from SQLite.")
-            log("info", "Theme mode enabled: using H1 headings as themes.")
+        # Build the tag pool (queries): if --include-tags provided, intersect and keep that order;
+        # otherwise use all unique tags discovered in the store.
+        if self.cfg.include_tags:
+            req = [t.strip().lower() for t in self.cfg.include_tags]
+            tag_pool = [t for t in all_tags if t in req]
         else:
-            default_queries = dynamic_queries if dynamic_queries else [
-                'caching strategies', 'load balancing', 'rate limiting', 'message queues', 'event driven architecture',
-                'microservices observability', 'database replication', 'consistency tradeoffs', 'api gateway', 'circuit breaker'
-            ]
+            tag_pool = list(all_tags)
 
-        if self.cfg.rag_max_queries:
-            queries = (self.cfg.rag_queries or default_queries)[:self.cfg.rag_max_queries]
-        else:
-            queries = (self.cfg.rag_queries or default_queries)[:max(count, 5)]
+        if not tag_pool:
+            log("warn", "No tags found in store; RAG will proceed with empty context.")
+            return {}, []
 
-        # Retrieve
-        all_docs = []
-        seen_snips = set()
-        for q in queries:
-            try:
-                over_k = k * (3 if (self.cfg.restrict_sources or self.cfg.include_tags or self.cfg.include_h1) else 1)
-                docs = []
-                try:
-                    # Prefer filtering by H1 metadata (single-theme mode)
-                    docs = self._vs.similarity_search(q, k=over_k, filter={"h1": q})
-                    if not docs:
-                        q_slug = self._slugify(q)
-                        docs = self._vs.similarity_search(q, k=over_k, filter={"h1": q_slug})
-                    if not docs:
-                        docs = self._vs.similarity_search(q, k=over_k)
-                except Exception as e:
-                    log("warn", f"retrieval failed for '{q}': {e}")
-                    continue
-            except Exception as e:
-                log("warn", f"retrieval failed for '{q}': {e}")
-                continue
-            for d in docs:
-                snippet = d.page_content[:1000].strip()
-                if snippet in seen_snips:
-                    continue
-                seen_snips.add(snippet)
-                all_docs.append((q, d, snippet))
-
-        # Filter cascade
-        def _slug(s: str) -> str: return self._slugify(s)
-        def _filter(docs_list):
-            if not (self.cfg.restrict_sources or self.cfg.include_tags or self.cfg.include_h1):
-                return docs_list
-            out = []
-            for q, d, snippet in docs_list:
-                md = getattr(d, 'metadata', {}) or {}
-                src = (md.get('source') or '').lower()
-                tags = [t.strip().lower() for t in (md.get('tags') or '').split(',') if t.strip()]
-                h1_slug = _slug(md.get('h1') or '')
-                keep = True
-                if self.cfg.restrict_sources:
-                    import fnmatch
-                    if not any((fnmatch.fnmatch(src, pat.lower()) if ('*' in pat or '?' in pat) else (pat.lower() in src))
-                               for pat in self.cfg.restrict_sources):
-                        keep = False
-                if keep and self.cfg.include_tags:
-                    # Support matching by TF-IDF keywords in tags
-                    if not any(t in tags for t in [t.lower() for t in self.cfg.include_tags]):
-                        keep = False
-                if keep and self.cfg.include_h1:
-                    if not h1_slug or all(ih not in h1_slug for ih in [_slug(h) for h in self.cfg.include_h1]):
-                        keep = False
-                if keep:
-                    out.append((q, d, snippet))
-            return out
-
-        working = _filter(all_docs)
-        if not working and (self.cfg.include_h1 or self.cfg.include_tags or self.cfg.restrict_sources):
-            if self.cfg.include_h1:
-                tmp_cfg = Config(**{**self.cfg.__dict__, "include_h1": None})
-                self.cfg = tmp_cfg
-                working = _filter(all_docs)
-            if not working and self.cfg.include_tags:
-                tmp_cfg = Config(**{**self.cfg.__dict__, "include_tags": None})
-                self.cfg = tmp_cfg
-                working = _filter(all_docs)
-            if not working and self.cfg.restrict_sources:
-                tmp_cfg = Config(**{**self.cfg.__dict__, "restrict_sources": None})
-                self.cfg = tmp_cfg
-                working = _filter(all_docs)
-
-        # Build RAG_CONTEXT.md
-        if not working:
-            log("warn", "RAG retrieval produced no context; no data available for quiz generation.")
-            return {}, queries
-
-        header = [
-            "# Retrieved Knowledge (Citations)",
-            "Each question MUST be grounded in one or more cited sections. Do NOT invent facts.",
-            "Guidance: Derive 'topic' from the PRIMARY cited section heading; keep it concise (1-4 words, Title Case). NEVER use 'RAG_CONTEXT'.",
-            "Each retrieval batch is restricted to a single theme (H1) selected randomly."
-        ]
-        bodies = []
-        citation_idx = 1
-        for _q, d, snippet in working:
-            heading = d.metadata.get('section_heading') or (snippet.split('\n', 1)[0][:80])
-            source = (d.metadata.get('source') or d.metadata.get('rel_path') or d.metadata.get('path') or 'unknown')
-            label = f"C{citation_idx}"; citation_idx += 1
-            header.append(f"{label}: {source} :: {heading}")
-            bodies.append(f"[{label}] (source: {source}, heading: {heading})\n{snippet}")
-
-        content = "\n".join(header) + "\n\n---\n\n" + "\n\n".join(bodies)
-        if self.cfg.dump_rag_context:
-            try:
-                Path(self.cfg.dump_rag_context).write_text(content, encoding='utf-8')
-                log("debug", f"Wrote full RAG context -> {self.cfg.dump_rag_context}")
-            except Exception as e:
-                log("warn", f"Could not write RAG context: {e}")
-        return {'RAG_CONTEXT.md': content}, queries
+        # We no longer build a large static context; each question will fetch its own blocks by tag.
+        queries = tag_pool
+        return files, queries
 
 # =========================
 # Quiz Orchestration
@@ -893,41 +901,21 @@ class Quiz:
             # Per-Q small context using query (if available)
             files_single = files_ctx
             if queries and self.rag._vs:
-                q = queries[idx % len(queries)]
+                if self.cfg.include_tags:
+                    q = queries[idx % len(queries)]  # deterministic cycle through provided tags
+                else:
+                    import random as _r
+                    q = _r.choice(queries)            # random tag per question
                 theme = q
-                try:
-                    docs = []
-                    try:
-                        q_slug = self.rag._slugify(q)
-                        docs = self.rag._vs.similarity_search(q, k=self.cfg.rag_k, filter={"h1": q})
-                        if not docs:
-                            docs = self.rag._vs.similarity_search(q, k=self.cfg.rag_k, filter={"h1": q_slug})
-                        if not docs:
-                            docs = self.rag._vs.similarity_search(q, k=self.cfg.rag_k)
-                    except Exception as e:
-                        log("warn", f"Per-question retrieval failed: {e}")
-                        docs = []
-                    if docs:
-                        seen, blocks = set(), []
-                        for d in docs:
-                            snippet = d.page_content[:1000].strip()
-                            if snippet in seen: continue
-                            seen.add(snippet)
-                            heading = d.metadata.get('section_heading') or (snippet.split('\n',1)[0][:80])
-                            source  = (d.metadata.get('source') or d.metadata.get('rel_path') or d.metadata.get('path') or 'unknown')
-                            blocks.append(f"[C1] (source: {source}, heading: {heading})\n{snippet}")
-                        if blocks:
-                            header = "\n".join([
-                                "# Retrieved Knowledge (Citations)",
-                                f"Query: {q}",
-                                "Each question MUST be grounded in one or more cited sections. Do NOT invent facts.",
-                                "Guidance: Derive 'topic' from the PRIMARY cited section heading; keep it concise (1-4 words, Title Case). NEVER use 'RAG_CONTEXT'."
-                            ])
-                            files_single = {'RAG_CONTEXT.md': header + "\n\n---\n\n" + "\n\n".join(blocks)}
-                except Exception as e:
-                    log("warn", f"Per-question retrieval failed: {e}")
+                maybe = self.rag.get_blocks_for_tag(q, self.cfg.rag_k)
+                if maybe:
+                    files_single = maybe
             elif queries:
-                q = queries[idx % len(queries)]
+                if self.cfg.include_tags:
+                    q = queries[idx % len(queries)]
+                else:
+                    import random as _r
+                    q = _r.choice(queries)
                 theme = q
 
             qlist = self._gen_one(files_single, provider, token, recent_norm, temperature, idx, theme=theme)
@@ -949,9 +937,9 @@ class Quiz:
                 )
                 try:
                     resp = self.providers._requests.post(
-                        'http://localhost:11434/api/generate',
+                        OLLAMA_URL,
                         json={'model': self.cfg.ollama_model, 'prompt': verify_prompt, 'stream': False, 'options': {'temperature': 0.0}},
-                        timeout=90
+                        timeout=VERIFY_HTTP_TIMEOUT
                     )
                     if resp.status_code != 200:
                         continue
@@ -978,6 +966,9 @@ class Quiz:
 def main(argv: List[str]) -> int:
     try:
         cfg = parse_args(argv)
+        if not cfg.rag_local and not os.environ.get('OPENAI_API_KEY'):
+            log("error", "OpenAI embeddings selected (--rag-openai) but OPENAI_API_KEY is not set. Either set the key or use --rag-local (default).")
+            return 1
         quiz = Quiz(cfg)
         questions, _ = quiz.run()
 

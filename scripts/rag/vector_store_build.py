@@ -1,7 +1,7 @@
 from __future__ import annotations
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-def extract_keywords_tfidf(texts: list[str], top_n: int = 5) -> list[list[str]]:
+def extract_keywords_tfidf(texts: list[str], top_n: int = 20) -> list[list[str]]:
     """Extract top N keywords for each document using TF-IDF."""
     vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
     tfidf_matrix = vectorizer.fit_transform(texts)
@@ -15,7 +15,7 @@ def extract_keywords_tfidf(texts: list[str], top_n: int = 5) -> list[list[str]]:
     return keywords_per_doc
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-def extract_keywords_tfidf(texts: list[str], top_n: int = 5) -> list[list[str]]:
+def extract_keywords_tfidf(texts: list[str], top_n: int = 20) -> list[list[str]]:
     """Extract top N keywords for each document using TF-IDF."""
     vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
     tfidf_matrix = vectorizer.fit_transform(texts)
@@ -208,7 +208,7 @@ def build(args):
 
         # Extract keywords for each PDF using TF-IDF
         if pdf_texts:
-            keywords_lists = extract_keywords_tfidf(pdf_texts, top_n=5)
+            keywords_lists = extract_keywords_tfidf(pdf_texts, top_n=20)
         else:
             keywords_lists = [[] for _ in pdf_texts]
 

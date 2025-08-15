@@ -149,7 +149,9 @@ def parse_args(argv: List[str]) -> Config:
     p.add_argument('--rag-k', type=int, default=4)
     p.add_argument('--rag-queries', nargs='+')
     p.add_argument('--rag-max-queries', type=int)
-    p.add_argument('--rag-local', action='store_true')
+    group = p.add_mutually_exclusive_group()
+    group.add_argument('--rag-local', dest='rag_local', action='store_true', default=True)
+    group.add_argument('--rag-openai', dest='rag_local', action='store_false')
     p.add_argument('--rag-embed-model', default='sentence-transformers/all-MiniLM-L6-v2')
     p.add_argument('--no-rag', dest='no_rag', action='store_true')
 
@@ -798,6 +800,9 @@ class Quiz:
 def main(argv: List[str]) -> int:
     try:
         cfg = parse_args(argv)
+        if not cfg.rag_local and not os.environ.get('OPENAI_API_KEY'):
+            log("error", "OpenAI embeddings selected (--rag-openai) but OPENAI_API_KEY is not set. Either set the key or use --rag-local (default).")
+            return 1
         quiz = Quiz(cfg)
         questions, _ = quiz.run()
         err = quiz.validate(questions, cfg.count)
