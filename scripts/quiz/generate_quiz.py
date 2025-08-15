@@ -745,6 +745,7 @@ class RAG:
                                for pat in self.cfg.restrict_sources):
                         keep = False
                 if keep and self.cfg.include_tags:
+                    # Support matching by TF-IDF keywords in tags
                     if not any(t in tags for t in [t.lower() for t in self.cfg.include_tags]):
                         keep = False
                 if keep and self.cfg.include_h1:

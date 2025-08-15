@@ -1,18 +1,9 @@
 #!/usr/bin/env python3
 """
-Modified version of generate_quiz.py for RAG-Workflow to operate without Markdown files.
-
-This script relaxes the requirement that Markdown files must exist when RAG is enabled.
-If no Markdown files are found and RAG is enabled (via the default settings or
-when --no-rag is not passed), the script will still proceed to build the
-retrieval-augmented context from the vector store and generate questions.
-
+Quiz generation script for RAG-Workflow. All context is retrieved from the vector database (Chroma).
+Markdown/template modes are deprecated and not supported.
 Usage example:
-  ./scripts/bin/run_venv.sh scripts/quiz/generate_quiz_rag_modified.py \
-    --ollama --ollama-model mistral --count 5 --quiz quiz.json --answers answer_key.json \
-    --rag-persist .chroma --rag-k 4 --rag-local --fresh
-
-All other command-line arguments mirror those of the original generate_quiz.py.
+    ./scripts/bin/run_venv.sh scripts/quiz/master.py --ollama --ollama-model mistral --count 5 --quiz quiz.json --answers answer_key.json --rag-persist .chroma --rag-k 4 --rag-local --fresh
 """
 
 from __future__ import annotations
@@ -71,7 +62,7 @@ class Question:
         }
 
 
-DEFAULT_SOURCES = ["system-design/designs/**/*.md", "devops/**/*.md"]
+DEFAULT_SOURCES = []
 HISTORY_FILE = Path(".quiz_history.json")
 
 @dataclass
@@ -96,7 +87,6 @@ class Config:
     dump_ollama_prompt: Optional[str]
     dump_ollama_payload: Optional[str]
     dump_llm_payload: Optional[str]
-    template: bool
     seed: int
     fresh: bool
     verify: bool
@@ -143,7 +133,6 @@ def parse_args(argv: List[str]) -> Config:
     p.add_argument('--dump-llm-payload')
 
     # Flow
-    p.add_argument('--template', action='store_true')
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--fresh', action='store_true')
     p.add_argument('--verify', action='store_true')
@@ -186,7 +175,6 @@ def parse_args(argv: List[str]) -> Config:
         dump_ollama_prompt=a.dump_ollama_prompt,
         dump_ollama_payload=a.dump_ollama_payload,
         dump_llm_payload=a.dump_llm_payload,
-        template=a.template,
         seed=a.seed,
         fresh=a.fresh,
         verify=a.verify,
@@ -205,17 +193,6 @@ def parse_args(argv: List[str]) -> Config:
     )
 
 
-def read_markdown_files(patterns: List[str]) -> Dict[str, str]:
-    files: Dict[str, str] = {}
-    for pattern in patterns:
-        for path in glob(pattern, recursive=True):
-            if not path.lower().endswith('.md'):
-                continue
-            try:
-                files[path] = Path(path).read_text(encoding='utf-8')
-            except Exception as e:
-                log("warn", f"failed reading {path}: {e}")
-    return files
 
 
 def _pretty_and_parse_raw_response(key: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -403,101 +380,28 @@ def _parse_model_questions(raw_json: str, provider: str) -> List[Question]:
     return out
 
 
-# Providers class remains unchanged; copy from original generate_quiz.py
 class Providers:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self._openai = None
-        self._OpenAIClient = None
-        self._openai_client = None
-        self._requests = None
+        # Lazy import so the script can run without requests when not using Ollama
         try:
             import requests  # type: ignore
             self._requests = requests
         except Exception:
-            pass
+            self._requests = None
+
+    def _dump_payload(self, prompt: str, payload: Dict[str, Any]) -> None:
+        # Best-effort debug dumps; ignore failures
         try:
-            import openai  # type: ignore
-            self._openai = openai
-            try:
-                from openai import OpenAI  # type: ignore
-                self._OpenAIClient = OpenAI
-                try:
-                    self._openai_client = OpenAI()
-                except Exception:
-                    self._openai_client = None
-            except Exception:
-                self._OpenAIClient = None
+            if self.cfg.dump_llm_payload:
+                Path(self.cfg.dump_llm_payload).write_text(prompt, encoding='utf-8')
+            if self.cfg.dump_ollama_payload:
+                Path(self.cfg.dump_ollama_payload).write_text(json.dumps(payload, indent=2), encoding='utf-8')
         except Exception:
             pass
-    def _dump_payload(self, prompt: str, payload: dict) -> None:
-        if self.cfg.dump_ollama_prompt:
-            try:
-                Path(self.cfg.dump_ollama_prompt).write_text(prompt, encoding='utf-8')
-                log("debug", f"Wrote full LLM prompt -> {self.cfg.dump_ollama_prompt}")
-            except Exception as e:
-                log("warn", f"Could not write prompt: {e}")
-        path = self.cfg.dump_llm_payload or self.cfg.dump_ollama_payload
-        if path:
-            try:
-                Path(path).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding='utf-8')
-                log("debug", f"Wrote LLM payload -> {path}")
-            except Exception as e:
-                log("warn", f"Could not write payload: {e}")
-    def openai_questions(self, files: Dict[str, str], count: int, model: str,
-                         token: str, recent_norm: List[str], temperature: float, *, iteration: Optional[int] = None) -> List[Question]:
-        if not self._openai:
-            raise RuntimeError('openai package not available')
-        if not os.getenv('OPENAI_API_KEY') and not self._openai_client:
-            raise RuntimeError('OPENAI_API_KEY not set')
-        max_chars = 28000
-        parts, total = [], 0
-        for pth, txt in files.items():
-            trimmed = txt[:2000]
-            part = f"\n# FILE: {pth}\n{trimmed}\n"
-            if total + len(part) > max_chars:
-                continue
-            parts.append(part)
-            total += len(part)
-        corpus = ''.join(parts)
-        recent_clause = ("Avoid reusing these prior question phrasings: " + '; '.join(recent_norm[:30])) if recent_norm else ''
-        system = (
-            "You are an assistant that creates high-quality multiple-choice quiz questions for system design and devops. "
-            "If citation lines like 'C<number>:' exist, you MUST base questions on them, pick a concise Title Case topic, "
-            "and return STRICT JSON with: id, question, options(4), topic, difficulty, answer, explanation. "
-            "The 'answer' MUST be a single letter A/B/C/D corresponding to the provided options; you may also include 'answer_letter' as the same letter."
-        )
-        user = (f"Uniqueness token: {token}. Generate {count} questions (IDs Q1..Q{count}). "
-                f"{recent_clause} Source material: {corpus[:12000]}")
-        start = time.time()
-        if self._openai_client:
-            resp = self._openai_client.chat.completions.create(
-                model=model,
-                messages=[{"role": "system", "content": system},
-                          {"role": "user", "content": user}],
-                temperature=temperature
-            )
-            content = resp.choices[0].message.content or ""
-            raw_response: Any = json.loads(resp.model_dump_json())
-        else:
-            self._openai.api_key = os.getenv('OPENAI_API_KEY')
-            resp = self._openai.ChatCompletion.create(
-                model=model,
-                messages=[{"role": "system", "content": system},
-                          {"role": "user", "content": user}],
-                temperature=temperature
-            )
-            content = resp['choices'][0]['message']['content'] or ""
-            raw_response = json.loads(json.dumps(resp, default=str))
-        duration = time.time() - start
-        iter_str = f"[{(iteration or 0)+1}/{self.cfg.count}] " if iteration is not None else ""
-        log("info", f"{iter_str}LLM response time (openai {model}): {duration:.2f}s")
-        m = re.search(r"```json\n(.*)```", content, re.DOTALL)
-        json_text = m.group(1) if m else content
-        questions = _parse_model_questions(json_text, provider='openai')
-        for q in questions:
-            q.raw_response = raw_response
-        return questions
+
+    def openai_questions(self, *args, **kwargs):
+        raise RuntimeError('OpenAI provider not enabled in this build. Use --ollama or implement openai_questions.')
     def ollama_questions(self, files: Dict[str, str], count: int, model: str,
                          token: str, recent_norm: List[str], temperature: float,
                          *, snippet_chars: int, corpus_chars: int, num_predict: Optional[int],
@@ -556,7 +460,7 @@ class Providers:
         log("info", f"{iter_str}LLM response time (ollama {model}{theme_str}): {duration:.2f}s")
         questions = _parse_model_questions(json_text, provider='ollama')
         for q in questions:
-            q.raw_response = data
+            q.raw_response = content
         return questions
 
 
@@ -788,21 +692,14 @@ class Quiz:
     def run(self) -> Tuple[List[Question], Dict[str,str]]:
         if self.cfg.count < 1:
             raise RuntimeError('--count must be at least 1')
-        files = read_markdown_files(self.cfg.sources)
-        # Modified: allow no markdown files if RAG is enabled
-        if not files and self.cfg.no_rag:
-            raise RuntimeError('No markdown files found.')
-        if not files:
-            log("warn", "No markdown files found. Proceeding with RAG-only context.")
-        if self.cfg.template and (self.cfg.ai or self.cfg.ollama):
-            log("warn", "--template provided; ignoring --ai/--ollama.")
-        if not self.cfg.template and not (self.cfg.ai or self.cfg.ollama):
-            raise RuntimeError('Must supply one of --template, --ollama or --ai.')
+        files: Dict[str, str] = {}
+        if self.cfg.no_rag:
+            raise RuntimeError('RAG disabled (--no-rag) but source files mode is not supported. Enable RAG to proceed.')
+        log("info", "RAG-only mode: building context exclusively from the vector store.")
+        if not (self.cfg.ai or self.cfg.ollama):
+            raise RuntimeError('Must supply one of --ollama or --ai.')
         files_ctx, queries = self.rag.build_context(files, k=self.cfg.rag_k, count=self.cfg.count)
         recent_norm = self._recent_history()
-        if self.cfg.template:
-            log("info", "Generating deterministic template questions…")
-            return template_questions(files_ctx, self.cfg.count, self.cfg.seed), files_ctx
         provider = 'ollama' if self.cfg.ollama else 'openai'
         base_temp = 0.6 if self.cfg.fresh else 0.4
         temperature = self.cfg.ollama_temperature if (self.cfg.ollama and self.cfg.ollama_temperature is not None) else base_temp

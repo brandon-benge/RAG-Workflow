@@ -1,3 +1,32 @@
+from __future__ import annotations
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+def extract_keywords_tfidf(texts: list[str], top_n: int = 5) -> list[list[str]]:
+    """Extract top N keywords for each document using TF-IDF."""
+    vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
+    tfidf_matrix = vectorizer.fit_transform(texts)
+    feature_names = vectorizer.get_feature_names_out()
+    keywords_per_doc = []
+    for doc_idx in range(tfidf_matrix.shape[0]):
+        row = tfidf_matrix.getrow(doc_idx)
+        top_indices = row.toarray()[0].argsort()[-top_n:][::-1]
+        keywords = [feature_names[i] for i in top_indices if row[0, i] > 0]
+        keywords_per_doc.append(keywords)
+    return keywords_per_doc
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+def extract_keywords_tfidf(texts: list[str], top_n: int = 5) -> list[list[str]]:
+    """Extract top N keywords for each document using TF-IDF."""
+    vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
+    tfidf_matrix = vectorizer.fit_transform(texts)
+    feature_names = vectorizer.get_feature_names_out()
+    keywords_per_doc = []
+    for doc_idx in range(tfidf_matrix.shape[0]):
+        row = tfidf_matrix.getrow(doc_idx)
+        top_indices = row.toarray()[0].argsort()[-top_n:][::-1]
+        keywords = [feature_names[i] for i in top_indices if row[0, i] > 0]
+        keywords_per_doc.append(keywords)
+    return keywords_per_doc
 #!/usr/bin/env python3
 """
 Build a local Chroma vector store from a released PDF bundle for the RAG-Workflow project.
@@ -20,8 +49,6 @@ you can install it via Homebrew (`brew install poppler`). On Debian/Ubuntu, use
 `apt install poppler-utils`.  The script will abort with an error if `pdftotext`
 is not available.
 """
-
-from __future__ import annotations
 
 import argparse
 import sys
@@ -148,11 +175,13 @@ def build(args):
                   "or ensure that the 'pdftotext' binary is in your PATH.")
             return 1
 
-        docs: List[Document] = []
+        docs = []
+        pdf_texts = []
+        pdf_h1s = []
+        pdf_paths_for_meta = []
 
         for pdf_path in pdf_paths:
             try:
-                # Use pdftotext to extract text; this relies on poppler utils being installed
                 result = subprocess.run(
                     ['pdftotext', str(pdf_path), '-'],
                     capture_output=True,
@@ -167,20 +196,31 @@ def build(args):
             lines = [line.strip() for line in text.splitlines() if line.strip()]
             if not lines:
                 continue
-            # Determine H1: skip first line if it starts with "Contents" (case-insensitive)
             first_line = lines[0]
             if first_line.lower().startswith('contents') and len(lines) > 1:
                 h1 = lines[1]
             else:
                 h1 = first_line
 
-            tags_list = derive_tags(pdf_path, h1)
+            pdf_texts.append(text)
+            pdf_h1s.append(h1)
+            pdf_paths_for_meta.append(pdf_path)
+
+        # Extract keywords for each PDF using TF-IDF
+        if pdf_texts:
+            keywords_lists = extract_keywords_tfidf(pdf_texts, top_n=5)
+        else:
+            keywords_lists = [[] for _ in pdf_texts]
+
+        for text, h1, pdf_path, keywords in zip(pdf_texts, pdf_h1s, pdf_paths_for_meta, keywords_lists):
             meta = {
                 'source': str(pdf_path),
-                'tags': ','.join(tags_list),
+                'tags': ','.join(keywords),
                 'h1': h1
             }
             docs.append(Document(page_content=text, metadata=meta))
+
+        print(f'PDF processing complete. {len(docs)} documents prepared for embedding.')
 
         if not docs:
             print('No valid PDF documents to embed.')

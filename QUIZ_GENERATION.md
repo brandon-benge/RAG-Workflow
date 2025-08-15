@@ -66,12 +66,11 @@ After building the vector store, you can generate quiz questions using the `mast
 **Primary (Offline, Ollama)**
 ```bash
 ./scripts/bin/run_venv.sh scripts/quiz/master.py --ollama --ollama-model mistral \
-  --count 5 --auto-build --local-embeddings \
+  --count 5 \
   --quiz quiz.json \
   --answers answer_key.json \
   --rag-persist .chroma \
-  --rag-k 3 \ 
-  --rag-local \
+  --rag-k 3 \
   --fresh
 ```
 
