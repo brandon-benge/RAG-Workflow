@@ -1,3 +1,10 @@
+# Ignore Chroma vector store and Python virtual environment
+.chroma/
+.chroma/**
+.venv/
 # Ignore all JSON and TXT files
 *.json
 .chroma
+patch.diff
+./*.txt
+./*.json

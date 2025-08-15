@@ -1,28 +1,21 @@
 from __future__ import annotations
-from sklearn.feature_extraction.text import TfidfVectorizer
+import os
 
 def extract_keywords_tfidf(texts: list[str], top_n: int = 20) -> list[list[str]]:
-    """Extract top N keywords for each document using TF-IDF."""
+    """Extract top N keywords per document using TF‑IDF. If scikit‑learn is not
+    available in the environment, fail."""
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer  # type: ignore
+    except Exception:
+        raise RuntimeError('scikit-learn is required for TF-IDF keyword tagging; install scikit-learn and re-run.')
+
     vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
     tfidf_matrix = vectorizer.fit_transform(texts)
     feature_names = vectorizer.get_feature_names_out()
-    keywords_per_doc = []
+    keywords_per_doc: list[list[str]] = []
     for doc_idx in range(tfidf_matrix.shape[0]):
         row = tfidf_matrix.getrow(doc_idx)
-        top_indices = row.toarray()[0].argsort()[-top_n:][::-1]
-        keywords = [feature_names[i] for i in top_indices if row[0, i] > 0]
-        keywords_per_doc.append(keywords)
-    return keywords_per_doc
-from sklearn.feature_extraction.text import TfidfVectorizer
-
-def extract_keywords_tfidf(texts: list[str], top_n: int = 20) -> list[list[str]]:
-    """Extract top N keywords for each document using TF-IDF."""
-    vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
-    tfidf_matrix = vectorizer.fit_transform(texts)
-    feature_names = vectorizer.get_feature_names_out()
-    keywords_per_doc = []
-    for doc_idx in range(tfidf_matrix.shape[0]):
-        row = tfidf_matrix.getrow(doc_idx)
+        # get indices of top_n tf-idf scores (descending)
         top_indices = row.toarray()[0].argsort()[-top_n:][::-1]
         keywords = [feature_names[i] for i in top_indices if row[0, i] > 0]
         keywords_per_doc.append(keywords)
@@ -40,9 +33,11 @@ derived from the PDF file's path and the computed H1, similar to the original Ma
 workflow.
 
 Usage example:
-  ./scripts/bin/run_venv.sh scripts/rag/vector_store_build_rag_modified.py \
-      --persist ./chroma_store \
-      --chunk-size 800 --chunk-overlap 120 --local
+  ./scripts/bin/run_venv.sh scripts/rag/vector_store_build.py \
+      --persist ./.chroma \
+      --chunk-size 800 --chunk-overlap 120 \
+      --local --model sentence-transformers/all-MiniLM-L6-v2 \
+      --bundle-url https://github.com/brandon-benge/InterviewPrep/releases/download/latest/pdfs-bundle.tar.gz
 
 This script requires the `pdftotext` utility from Poppler to be installed. On macOS,
 you can install it via Homebrew (`brew install poppler`). On Debian/Ubuntu, use
@@ -125,31 +120,21 @@ def build(args):
     if args.force and persist_dir.exists():
         shutil.rmtree(persist_dir)
 
-    # Location of PDF bundle: try local file first, else download
-    pdf_url = "https://github.com/brandon-benge/InterviewPrep/releases/download/latest/pdfs-bundle.tar.gz"
-    local_tar = Path('pdfs-bundle.tar.gz')
+    # Location of PDF bundle: always download (fail if unavailable)
+    pdf_url = args.bundle_url
 
     # Temporary directory for extraction
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
         tar_path = tmp_path / 'pdfs-bundle.tar.gz'
 
-        # Attempt to use an existing local tarball if present
-        if local_tar.exists():
-            try:
-                shutil.copy(local_tar, tar_path)
-                print(f'Using local PDF bundle: {local_tar}')
-            except Exception as e:
-                print(f'ERROR: could not copy local PDF bundle: {e}')
-                return 1
-        else:
-            # Download the tarball
-            print(f'Downloading PDF bundle from {pdf_url}...')
-            try:
-                urllib.request.urlretrieve(pdf_url, tar_path)
-            except Exception as e:
-                print(f'ERROR: failed to download PDF bundle: {e}')
-                return 1
+        # Always download the bundle; do not use any local tarball.
+        print(f'Downloading PDF bundle from {pdf_url}...')
+        try:
+            urllib.request.urlretrieve(pdf_url, tar_path)
+        except Exception as e:
+            print(f'ERROR: failed to download PDF bundle: {e}')
+            return 1
 
         # Extract the tarball with a safe filter to avoid future deprecation warnings
         print('Extracting PDF bundle...')
@@ -206,11 +191,18 @@ def build(args):
             pdf_h1s.append(h1)
             pdf_paths_for_meta.append(pdf_path)
 
-        # Extract keywords for each PDF using TF-IDF
-        if pdf_texts:
+        # Extract keywords for each PDF using TF-IDF (fail if unavailable or empty)
+        if not pdf_texts:
+            print('ERROR: No extracted text to tag from PDFs.')
+            return 1
+        try:
             keywords_lists = extract_keywords_tfidf(pdf_texts, top_n=20)
-        else:
-            keywords_lists = [[] for _ in pdf_texts]
+        except Exception as e:
+            print(f'ERROR: keyword extraction failed: {e}')
+            return 1
+        if any(not kw for kw in keywords_lists):
+            print('ERROR: One or more PDFs produced no tags; aborting build. Ensure scikit-learn is installed and PDFs contain extractable text.')
+            return 1
 
         for text, h1, pdf_path, keywords in zip(pdf_texts, pdf_h1s, pdf_paths_for_meta, keywords_lists):
             meta = {
@@ -232,6 +224,11 @@ def build(args):
         avg_len = sum(len(s.page_content) for s in splits) // max(len(splits), 1)
         print(f'Generated {len(splits)} chunks (avg ~{avg_len} chars).')
 
+        # Enforce embedding mode and secrets
+        if args.openai and not os.environ.get('OPENAI_API_KEY'):
+            print('ERROR: --openai selected but OPENAI_API_KEY is not set.')
+            return 1
+
         # Initialize embeddings and persist to Chroma
         emb = embedding_fn(args.local, args.model)
         print('Embedding & persisting to Chroma...')
@@ -245,12 +242,15 @@ def build(args):
 
 def parse(argv):
     ap = argparse.ArgumentParser()
-    ap.add_argument('--persist', default='.chroma', help='Persistence directory')
-    ap.add_argument('--chunk-size', type=int, default=1000)
-    ap.add_argument('--chunk-overlap', type=int, default=150)
+    ap.add_argument('--persist', required=True, help='Persistence directory (required)')
+    ap.add_argument('--chunk-size', type=int, required=True, help='Chunk size (required)')
+    ap.add_argument('--chunk-overlap', type=int, required=True, help='Chunk overlap (required)')
+    ap.add_argument('--model', required=True, help='Embedding model name (required)')
+    ap.add_argument('--bundle-url', required=True, help='Download this tar.gz bundle of PDFs (required)')
+    group = ap.add_mutually_exclusive_group(required=True)
+    group.add_argument('--local', action='store_true', help='Use local HuggingFace embedding model (required choice)')
+    group.add_argument('--openai', action='store_true', help='Use OpenAI embeddings (required choice)')
     ap.add_argument('--force', action='store_true', help='Rebuild even if directory exists')
-    ap.add_argument('--local', action='store_true', help='Use local HuggingFace embedding model')
-    ap.add_argument('--model', default='', help='Embedding model (OpenAI embedding or local HF)')
     return ap.parse_args(argv)
 
 if __name__ == '__main__':

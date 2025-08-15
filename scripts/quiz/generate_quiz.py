@@ -366,6 +366,25 @@ def _parse_model_questions(raw_json: str, provider: str) -> List[Question]:
     items = _to_list(data)
     out: List[Question] = []
 
+    def format_options(options):
+        """
+        Robustly handles options that may be:
+        - a list of strings (each option)
+        - a single string with embedded newlines
+        - a list with one string containing embedded newlines
+        Returns a list of clean option strings.
+        """
+        if isinstance(options, list):
+            result = []
+            for opt in options:
+                if isinstance(opt, str):
+                    result.extend([o.strip() for o in opt.split('\n') if o.strip()])
+            return result
+        elif isinstance(options, str):
+            return [opt.strip() for opt in options.split('\n') if opt.strip()]
+        else:
+            return []
+
     for idx, obj in enumerate(items, start=1):
         if not isinstance(obj, dict):
             continue
@@ -382,7 +401,7 @@ def _parse_model_questions(raw_json: str, provider: str) -> List[Question]:
             if not cand:
                 cand = ['Option A', 'Option B', 'Option C', 'Option D']
             raw_opts = cand
-        options = [str(o).strip() for o in raw_opts][:4]
+        options = format_options(raw_opts)[:4]
         while len(options) < 4:
             options.append(f'Extra {len(options)+1}')
 
