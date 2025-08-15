@@ -18,13 +18,19 @@ flowchart TD
     b0 -->|yes| b1["Download PDF Bundle (--bundle-url)"]
     b0 -->|no| p0
     b1 --> b2["Extract PDFs"]
-    b2 --> b3["Derive H1 (first real line or title)"]
-    b3 --> b4["Split to Chunks (chunk_size / chunk_overlap)"]
-    b4 --> b5{"Embeddings Mode"}
+    b2 --> b2a["Extract Text from PDFs"]
+    b2a --> b3["Derive H1 (first meaningful line or title)"]
+    b3 --> b2b["Generate Tags via extract_keywords_tfidf"]
+    b2b --> b2c{"Tags present for all docs?"}
+    b2c -->|no| b2e["Fail build (missing tags)"]
+    b2c -->|yes| b4["Split to Chunks (chunk_size / chunk_overlap)"]
+    b4 --> b4a["Attach metadata (h1, tags)"]
+    b4a --> b5{"Embeddings Mode"}
     b5 -->|local=true| b6["Local Embeddings (HF model)"]
     b5 -->|openai=true| b7["OpenAI Embeddings (OPENAI_API_KEY)"]
-    b6 --> b8["Persist to Chroma (persist dir)"]
-    b7 --> b8
+    b6 --> b7a["Insert into metastore (Chroma)"]
+    b7 --> b7a
+    b7a --> b8["Persist to Chroma (persist dir)"]
   end
 
   %% ====== PREPARE (QUIZ GENERATION) ======
@@ -40,7 +46,7 @@ flowchart TD
     p5 -->|else| p7["Choose random tag per question"]
     p6 --> p8
     p7 --> p8
-    p8["Retrieve top-k Chunks from Chroma by tag/H1"] --> p9["Compose Prompt"]
+    p8["Retrieve top-k Chunks from Chroma by tag or H1"] --> p9["Compose Prompt"]
     p9 --> p10["LLM Generate Q/A/Expl"]
     p10 --> p11["Validate Structure (count, options, letter)"]
     p11 --> p12["Accumulate"]
@@ -85,7 +91,6 @@ ollama pull mistral
 
 **Vector Store Build (Local Embeddings)**
 ```bash
-If `[build] enabled=true` in `quiz.params`, run:
 ./master.py build
 ```
 This will build the vector store using the settings under the `[build]` section (e.g., embedding model, chunk size, persist directory). The vector store is written to the directory specified by `persist` (e.g., `.chroma`). Rebuilding (e.g., force, embedding mode, chunk sizes) is controlled by the `[build]` section.
@@ -164,10 +169,10 @@ This will prompt you for each question and provide immediate feedback.
 
 ## Providers & Status
 
-| Provider | Config Source | Max Questions | Status | Notes |
-|----------|----------------|---------------|--------|-------|
-| OpenAI   | `quiz.params`  | 20            | Experimental | Requires `OPENAI_API_KEY`; configured via `[prepare]` |
-| Ollama   | `quiz.params`  | 5             | Primary      | Offline / fast iteration / zero API cost; configured via `[prepare]` |
+| Provider | Config Source | Status | Notes |
+|----------|----------------|--------|-------|
+| OpenAI   | `quiz.params`  | Experimental | Requires `OPENAI_API_KEY`; configured via `[prepare]` |
+| Ollama   | `quiz.params`  | Primary      | Offline / fast iteration / zero API cost; configured via `[prepare]` |
 
 > **Accuracy Note (Ollama):** Local models may occasionally produce mismatches (e.g. the answer letter not conceptually matching the best option, weak explanations, or subtly duplicated stems). Validate logically.  If a question looks off: (1) re‑run with `fresh=true` in params; (2) adjust retrieval filters; or (3) manually correct.  The validator checks structure, not semantic truth.  OpenAI path can yield different style but is optional/experimental.
 
@@ -189,13 +194,6 @@ ollama pull mistral
 ```
 > Manage via tasks (Install / Start / Stop / Check) or CLI (`brew services start ollama`).
 
----
-
-## Customizing
-
-- **Change models:** Edit `[prepare] provider` and `model` (e.g., `provider=ollama`, `model=mistral`).
-- **Improve novelty:** Set `fresh=true` in `[prepare]`.
-- **Deterministic retrieval focus:** Edit `[prepare.rag]` values (`include_tags`, `include_h1`, `restrict_sources`).
 
 ---
 
