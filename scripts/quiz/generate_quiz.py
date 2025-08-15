@@ -374,13 +374,38 @@ def _parse_model_questions(raw_json: str, provider: str) -> List[Question]:
         - a list with one string containing embedded newlines
         Returns a list of clean option strings.
         """
+        import re
+        def split_by_letters(text):
+            # Split on A), B), C), D) or similar patterns
+            pattern = r'([A-D][\)\.\:]\s*)'
+            parts = re.split(pattern, text)
+            result = []
+            buffer = ''
+            for part in parts:
+                if re.match(pattern, part):
+                    if buffer:
+                        result.append(buffer.strip())
+                    buffer = part
+                else:
+                    buffer += part
+            if buffer:
+                result.append(buffer.strip())
+            # Clean up: remove leading A), B), etc. and also any leading numbers/letters and punctuation
+            return [re.sub(r'^[A-Da-d0-9][\)\.\:]\s*', '', opt).strip() for opt in result if opt.strip()]
+
         if isinstance(options, list):
             result = []
             for opt in options:
                 if isinstance(opt, str):
-                    result.extend([o.strip() for o in opt.split('\n') if o.strip()])
+                    # If option contains all choices, split by letters
+                    if re.search(r'[A-D][\)\.\:]', opt):
+                        result.extend(split_by_letters(opt))
+                    else:
+                        result.extend([o.strip() for o in opt.split('\n') if o.strip()])
             return result
         elif isinstance(options, str):
+            if re.search(r'[A-D][\)\.\:]', options):
+                return split_by_letters(options)
             return [opt.strip() for opt in options.split('\n') if opt.strip()]
         else:
             return []

@@ -49,6 +49,24 @@ def dispatch(argv: List[str]) -> Optional[int]:
     if sub == 'build':
         # Only pre-build vector store
         if 'build' in cfg and bool_true(cfg['build'].get('enabled','false')):
+            # --- Ollama preflight check ---
+            ollama_check = repo_root / 'scripts' / 'rag' / 'check_ollama.py'
+            runner = repo_root / 'scripts' / 'bin' / 'run_venv.sh'
+            log('info', 'Checking if Ollama is running...')
+            check_cmd = [str(runner), str(ollama_check), 'check'] if runner.exists() else [sys.executable, str(ollama_check), 'check']
+            check_result = subprocess.run(check_cmd)
+            if check_result.returncode != 0:
+                log('warning', 'Ollama is not running. Attempting to start Ollama...')
+                start_cmd = [str(runner), str(ollama_check), 'start'] if runner.exists() else [sys.executable, str(ollama_check), 'start']
+                start_result = subprocess.run(start_cmd)
+                if start_result.returncode != 0:
+                    log('error', 'Failed to start Ollama. Please start it manually and retry.')
+                    return 1
+                else:
+                    log('info', 'Ollama started successfully.')
+            else:
+                log('info', 'Ollama is already running.')
+            # --- Continue with build ---
             build_script = repo_root / 'scripts' / 'rag' / 'vector_store_build.py'
             breq = require_keys('build', cfg, ['persist','chunk_size','chunk_overlap','model','bundle_url'])
             b_local = bool_true(cfg['build'].get('local','false'))
@@ -70,9 +88,9 @@ def dispatch(argv: List[str]) -> Optional[int]:
                 '--model', breq['model'],
                 '--bundle-url', breq['bundle_url'],
             ]
-            log('info', f"Pre-building vector store via params: {' '.join(build_args)}")
-            runner = repo_root / 'scripts' / 'bin' / 'run_venv.sh'
-            rc = subprocess.run([str(runner), *build_args]).returncode if runner.exists() else subprocess.run([sys.executable, *build_args]).returncode
+            cmd = [str(runner), *build_args] if runner.exists() else [sys.executable, *build_args]
+            log('info', f"Executing command: {' '.join(cmd)}")
+            rc = subprocess.run(cmd).returncode
             return rc
     # No further steps after build; exit after build step
 
@@ -101,26 +119,30 @@ def dispatch(argv: List[str]) -> Optional[int]:
         else:
             args.append('--rag-local')
         runner = repo_root / 'scripts' / 'bin' / 'run_venv.sh'
-        return subprocess.run([str(runner), *args]).returncode if runner.exists() else subprocess.run([sys.executable, *args]).returncode
-
+        cmd = [str(runner), *args] if runner.exists() else [sys.executable, *args]
+        log('info', f"Executing command: {' '.join(cmd)}")
+        return subprocess.run(cmd).returncode
     elif sub == 'export':
         req = require_keys('export', cfg, ['quiz','out'])
         args = [str(repo_root / 'scripts' / 'quiz' / 'export_quiz_text.py'), '--quiz', req['quiz'], '--out', req['out']]
         runner = repo_root / 'scripts' / 'bin' / 'run_venv.sh'
-        return subprocess.run([str(runner), *args]).returncode if runner.exists() else subprocess.run([sys.executable, *args]).returncode
-
+        cmd = [str(runner), *args] if runner.exists() else [sys.executable, *args]
+        log('info', f"Executing command: {' '.join(cmd)}")
+        return subprocess.run(cmd).returncode
     elif sub == 'parse':
         req = require_keys('parse', cfg, ['in','out'])
         args = [str(repo_root / 'scripts' / 'quiz' / 'parse_marked_quiz.py'), '--in', req['in'], '--out', req['out']]
         runner = repo_root / 'scripts' / 'bin' / 'run_venv.sh'
-        return subprocess.run([str(runner), *args]).returncode if runner.exists() else subprocess.run([sys.executable, *args]).returncode
-
+        cmd = [str(runner), *args] if runner.exists() else [sys.executable, *args]
+        log('info', f"Executing command: {' '.join(cmd)}")
+        return subprocess.run(cmd).returncode
     elif sub == 'validate':
         req = require_keys('validate', cfg, ['quiz','answers'])
         args = [str(repo_root / 'scripts' / 'quiz' / 'validate_quiz_answers.py'), '--quiz', req['quiz'], '--answers', req['answers']]
         runner = repo_root / 'scripts' / 'bin' / 'run_venv.sh'
-        return subprocess.run([str(runner), *args]).returncode if runner.exists() else subprocess.run([sys.executable, *args]).returncode
-
+        cmd = [str(runner), *args] if runner.exists() else [sys.executable, *args]
+        log('info', f"Executing command: {' '.join(cmd)}")
+        return subprocess.run(cmd).returncode
     else:
         log('error', f"Unknown subcommand: {sub}")
         return 2

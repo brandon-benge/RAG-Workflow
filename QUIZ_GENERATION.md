@@ -78,17 +78,6 @@ brew install ollama
 ollama pull mistral
 ```
 
-**Check Ollama Status**
-```bash
-./scripts/bin/run_venv.sh scripts/rag/check_ollama.py check
-```
-
-**Start/Stop Ollama Service**
-```bash
-./scripts/bin/run_venv.sh scripts/rag/check_ollama.py start
-./scripts/bin/run_venv.sh scripts/rag/check_ollama.py stop
-```
-
 **Vector Store Build (Local Embeddings)**
 ```bash
 ./master.py build
