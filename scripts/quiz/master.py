@@ -28,11 +28,17 @@ def log(level: str, msg: str) -> None:
     ts = _dt.now().isoformat(timespec='seconds')
     _orig_print(f"[{ts}] [{level}] {msg}")
 
+
 def print(*args, **kwargs):  # type: ignore
     if args and isinstance(args[0], str):
         ts = _dt.now().isoformat(timespec='seconds')
         args = (f"[{ts}] {args[0]}",) + args[1:]
     return _orig_print(*args, **kwargs)
+
+# --- Constants ---
+OLLAMA_URL = "http://localhost:11434/api/generate"
+DEFAULT_HTTP_TIMEOUT = 240
+VERIFY_HTTP_TIMEOUT = 90
 
 
 @dataclass
@@ -447,7 +453,7 @@ class Providers:
             except Exception:
                 pass
         start = time.time()
-        resp = self._requests.post('http://localhost:11434/api/generate', json=payload, timeout=240)
+        resp = self._requests.post(OLLAMA_URL, json=payload, timeout=DEFAULT_HTTP_TIMEOUT)
         if resp.status_code != 200:
             raise RuntimeError(f'Ollama HTTP {resp.status_code}: {resp.text[:200]}')
         data = resp.json()
@@ -465,6 +471,41 @@ class Providers:
 
 
 class RAG:
+
+    def get_blocks_for_theme(self, theme: str, k: int) -> Optional[Dict[str, str]]:
+        if not self._vs:
+            return None
+        q = theme
+        try:
+            q_slug = self._slugify(q)
+            docs = self._vs.similarity_search(q, k=k, filter={"h1": q})
+            if not docs:
+                docs = self._vs.similarity_search(q, k=k, filter={"h1": q_slug})
+            if not docs:
+                docs = self._vs.similarity_search(q, k=k)
+        except Exception as e:
+            log("warn", f"Per-question retrieval failed: {e}")
+            docs = []
+        if not docs:
+            return None
+        seen, blocks = set(), []
+        for d in docs:
+            snippet = d.page_content[:1000].strip()
+            if snippet in seen:
+                continue
+            seen.add(snippet)
+            heading = d.metadata.get('section_heading') or (snippet.split('\n',1)[0][:80])
+            source  = (d.metadata.get('source') or d.metadata.get('rel_path') or d.metadata.get('path') or 'unknown')
+            blocks.append(f"[C1] (source: {source}, heading: {heading})\n{snippet}")
+        if not blocks:
+            return None
+        header = "\n".join([
+            "# Retrieved Knowledge (Citations)",
+            f"Query: {q}",
+            "Each question MUST be grounded in one or more cited sections. Do NOT invent facts.",
+            "Guidance: Derive 'topic' from the PRIMARY cited section heading; keep it concise (1-4 words, Title Case). NEVER use 'RAG_CONTEXT'."
+        ])
+        return {'RAG_CONTEXT.md': header + "\n\n---\n\n" + "\n\n".join(blocks)}
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self._vs = None
@@ -709,43 +750,12 @@ class Quiz:
             theme = None
             files_single = files_ctx
             if queries and self.rag._vs:
-                q = queries[idx % len(queries)]
-                theme = q
-                try:
-                    docs = []
-                    try:
-                        q_slug = self.rag._slugify(q)
-                        docs = self.rag._vs.similarity_search(q, k=self.cfg.rag_k, filter={"h1": q})
-                        if not docs:
-                            docs = self.rag._vs.similarity_search(q, k=self.cfg.rag_k, filter={"h1": q_slug})
-                        if not docs:
-                            docs = self.rag._vs.similarity_search(q, k=self.cfg.rag_k)
-                    except Exception as e:
-                        log("warn", f"Per-question retrieval failed: {e}")
-                        docs = []
-                    if docs:
-                        seen, blocks = set(), []
-                        for d in docs:
-                            snippet = d.page_content[:1000].strip()
-                            if snippet in seen:
-                                continue
-                            seen.add(snippet)
-                            heading = d.metadata.get('section_heading') or (snippet.split('\n',1)[0][:80])
-                            source  = (d.metadata.get('source') or d.metadata.get('rel_path') or d.metadata.get('path') or 'unknown')
-                            blocks.append(f"[C1] (source: {source}, heading: {heading})\n{snippet}")
-                        if blocks:
-                            header = "\n".join([
-                                "# Retrieved Knowledge (Citations)",
-                                f"Query: {q}",
-                                "Each question MUST be grounded in one or more cited sections. Do NOT invent facts.",
-                                "Guidance: Derive 'topic' from the PRIMARY cited section heading; keep it concise (1-4 words, Title Case). NEVER use 'RAG_CONTEXT'."
-                            ])
-                            files_single = {'RAG_CONTEXT.md': header + "\n\n---\n\n" + "\n\n".join(blocks)}
-                except Exception as e:
-                    log("warn", f"Per-question retrieval failed: {e}")
+                theme = queries[idx % len(queries)]
+                maybe = self.rag.get_blocks_for_theme(theme, self.cfg.rag_k)
+                if maybe:
+                    files_single = maybe
             elif queries:
-                q = queries[idx % len(queries)]
-                theme = q
+                theme = queries[idx % len(queries)]
             qlist = self._gen_one(files_single, provider, token, recent_norm, temperature, idx, theme=theme)
             if qlist:
                 q = qlist[0]
@@ -763,9 +773,9 @@ class Quiz:
                 )
                 try:
                     resp = self.providers._requests.post(
-                        'http://localhost:11434/api/generate',
+                        OLLAMA_URL,
                         json={'model': self.cfg.ollama_model, 'prompt': verify_prompt, 'stream': False, 'options': {'temperature': 0.0}},
-                        timeout=90
+                        timeout=VERIFY_HTTP_TIMEOUT
                     )
                     if resp.status_code != 200:
                         continue
