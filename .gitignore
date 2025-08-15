@@ -1,2 +1,3 @@
 # Ignore all JSON and TXT files
 *.json
+.chroma/*
