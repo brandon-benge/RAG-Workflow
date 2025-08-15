@@ -19,7 +19,7 @@ flowchart TD
 
 ## 1. Install Ollama & Build the Vector Store
 
-The quiz pipeline is built around an **offline PDF bundle**. The `vector_store_build.py` script downloads the latest PDF bundle from the GitHub releases page, extracts the PDF files, derives headings from the first meaningful line of each document, and stores the content in a Chroma vector store for retrieval. You only need to run this step when you first set up the system or when new content is added.
+The first step in the workflow is to **build the vector store** from your PDF bundle. The `vector_store_build.py` script downloads the latest PDF bundle from the GitHub releases page, extracts the PDF files, derives headings from the first meaningful line of each document, and stores the content in a Chroma vector store for retrieval. This step is only required when you first set up the system or when new content is added. **Quiz generation does not occur in this step.** All settings for building are read from the `[build]` section of `quiz.params`.
 
 **Ollama Installation**
 ```bash
@@ -40,36 +40,40 @@ ollama pull mistral
 
 **Vector Store Build (Local Embeddings)**
 ```bash
-./master.py prepare
+If `[build] enabled=true` in `quiz.params`, run:
+./master.py build
 ```
-This reads all settings from `quiz.params`, runs the optional pre-build step if `[build] enabled=true`, downloads the `pdfs-bundle.tar.gz` release asset, extracts the PDFs, processes them into chunks, and writes the Chroma database into the directory specified by `persist` in `quiz.params` (e.g., `.chroma`). Rebuild behavior (e.g., force, embedding mode, chunk sizes) is controlled entirely by the `[build]` section.
+This will build the vector store using the settings under the `[build]` section (e.g., embedding model, chunk size, persist directory). The vector store is written to the directory specified by `persist` (e.g., `.chroma`). Rebuilding (e.g., force, embedding mode, chunk sizes) is controlled by the `[build]` section.
 
 **Vector Store Build (OpenAI Embeddings)**
 
-Set `openai=true` (and `local=false`) in the `[build]` section of `quiz.params`, export `OPENAI_API_KEY`, then run:
-
+To use OpenAI embeddings, set `openai=true` (and `local=false`) in the `[build]` section of `quiz.params`, export `OPENAI_API_KEY`, then run:
 ```bash
-./master.py prepare
+./master.py build
 ```
-
-All embedding and build options come from `quiz.params`.
+All embedding and build options for the vector store come from the `[build]` section of `quiz.params`.
 
 ---
 
 ## 2. Generate the Quiz
 
-After building the vector store, you can generate quiz questions using the `master.py prepare` command.  The prepare step automatically checks the vector store, builds it if needed (when `[build] enabled=true` is supplied), and invokes `generate_quiz.py` with the appropriate flags.
+After the vector store has been built (using `./master.py build`), generate quiz questions using:
+
+```bash
+./master.py prepare
+```
+
+**This step is responsible for quiz generation only, using the vector store built in the previous step.** All quiz generation settings are read from the `[prepare]` section of `quiz.params`. The master script does not accept CLI flags for quiz generation.
 
 **Primary (Offline, Ollama)**
 ```bash
 ./master.py prepare
 ```
-This generates questions using provider and model settings from `quiz.params` (e.g., `provider=ollama`, `model=mistral`). Question count, output file names, retrieval parameters, and freshness are all defined in `[prepare]`.
+This generates quiz questions using the vector store and the provider/model specified in `[prepare]` (e.g., `provider=ollama`, `model=mistral`). Question count, output file names, retrieval parameters, and freshness are all defined in `[prepare]`.
 
 **Experimental (OpenAI)**
 
 Set `provider=ai` and `model=<openai-model>` in `[prepare]` of `quiz.params`, export `OPENAI_API_KEY`, then run:
-
 ```bash
 ./master.py prepare
 ```
@@ -110,7 +114,8 @@ This will prompt you for each question and provide immediate feedback.
 
 - `quiz.json` – list of question objects (no answers)
 - `answer_key.json` – mapping question id -> `{ answer, explanation }`
-- `quiz.txt` – markable plain text template (optional, created by prepare script unless `--no-text`)
+- `quiz.txt` – markable plain text export (created by 
+`./master.py export` )
 
 ## Providers & Status
 
@@ -153,16 +158,21 @@ ollama pull mistral
 
 The quiz pipeline now automatically retrieves context from a Chroma vector store before LLM prompting. All quiz context comes from the vector database. Markdown files are not used for quiz generation.
 
+### Build vs. Prepare: Responsibilities
+
+- The **build** step is for constructing the vector store, using all settings from the `[build]` section of `quiz.params`. This includes downloading PDFs, extracting, chunking, and embedding.
+- The **prepare** step is for generating the quiz, using all settings from the `[prepare]` section of `quiz.params`. This step retrieves context from the vector store and creates questions.
+
 ### Preflight Validation (`master.py prepare`)
 
-Before generating questions the master script will:
-1. Build the vector store if `[build] enabled=true`.
-2. Validate provider connectivity per `[prepare]` (OpenAI key or Ollama daemon).
-3. Proceed with generation using retrieval parameters in `[prepare]` and `[prepare.rag]`.
+When you run `./master.py prepare`, the script will:
+1. Build the vector store **only if** `[build] enabled=true` in `quiz.params`. (This is a convenience pre-check to ensure the vector store exists and is up to date.)
+2. Validate provider connectivity as specified in `[prepare]` (OpenAI key or Ollama daemon).
+3. Generate the quiz using retrieval and quiz parameters from `[prepare]` and `[prepare.rag]`.
 
 ### Vector Store Build (Manual / CI)
 
-Prefer `./master.py prepare` which drives the pre-build from `quiz.params`. For CI or manual control, call the builder directly (all flags required):
+Prefer `./master.py prepare` for an automated workflow that will build the vector store if needed and then generate the quiz. For CI or manual control of only the build step, call the builder directly (all flags required):
 
 ```bash
 ./scripts/bin/run_venv.sh scripts/rag/vector_store_build.py \
@@ -175,14 +185,12 @@ Prefer `./master.py prepare` which drives the pre-build from `quiz.params`. For 
   --force
 ```
 
-### New Master Flags
-
 ### quiz.params (minimal skeleton)
 
 ```ini
 [build]
-enabled=true
-persist=.chroma
+enabled=true               # Controls whether the vector store is (re)built before quiz generation
+persist=.chroma            # Directory for the vector store
 chunk_size=800
 chunk_overlap=120
 model=sentence-transformers/all-MiniLM-L6-v2
@@ -192,12 +200,12 @@ openai=false
 force=true
 
 [prepare]
-provider=ollama
+provider=ollama            # Controls which LLM provider is used for quiz generation
 model=mistral
 count=5
 quiz=quiz.json
 answers=answer_key.json
-rag_persist=.chroma
+rag_persist=.chroma        # Path to the vector store to use for retrieval
 rag_k=3
 fresh=true
 rag_local=true
@@ -209,27 +217,20 @@ include_h1=
 restrict_sources=
 ```
 
-### Source & Tag / H1 Filtering (Direct `generate_quiz.py`)
+### Source & Tag / H1 Filtering
 
-> Set filters in `[prepare.rag]` inside `quiz.params` (e.g., `include_tags=caching consistency`, `include_h1=rate-limiting`, `restrict_sources=pdfs`). Then run `./master.py prepare`.
-
-Notes:
-
-- Filters are also available via `master.py prepare` (pass them after provider flags).  Previously they were only for direct `generate_quiz.py` calls.
-- Tags & H1 slugs are lowercase internally; supply lowercase values.
-- The filters combine as OR within a category and AND across categories.
-- Exclusion flags (`--exclude-tags`, etc.) are not implemented yet.
+> Set filters in `[prepare.rag]` inside `quiz.params` (e.g., `include_tags=caching consistency`, `include_h1=rate-limiting`, `restrict_sources=pdfs`). Then run `./master.py prepare`. These values affect only quiz generation and retrieval, not vector store building. No CLI flags are accepted by `master.py`.
 
 ### Recommended Settings
 
 - Keep `rag_k` between 3–5.
-- Rebuild the store (`[build] enabled=true` or manual) after adding new PDFs to the release bundle.
+- Rebuild the store (`[build] enabled=true` or manual build) after adding new PDFs to the release bundle.
 - Prefer local embeddings for consistent offline workflow (`local=true`).
 - Use OpenAI embeddings only if you explicitly need broader semantic recall (experimental path).
 
 ### Disabling RAG (Debug Only)
 
-If you need to benchmark raw behavior or inspect model output without context, call `generate_quiz.py` directly with `--no-rag` (the master script always uses RAG).
+If you need to benchmark raw behavior or inspect model output without context, call `generate_quiz.py` directly with `--no-rag` (the master script always uses RAG and expects a vector store to exist).
 
 ### Maintenance Tips
 
