@@ -7,57 +7,57 @@ This workflow guides you through setting up your local AI quiz system, generatin
 ```mermaid
 flowchart TD
   %% ====== SETUP ======
-  subgraph S[Setup]
-    S1[Install Ollama (brew install ollama)] --> S2[Pull Model (ollama pull mistral)]
-    S3[Check/Start Ollama (check_ollama.py)] --> S4[Verify Params (quiz.params)]
+  subgraph setup["Setup"]
+    s1["Install Ollama (brew install ollama)"] --> s2["Pull Model (ollama pull mistral)"]
+    s3["Check/Start Ollama (check_ollama.py)"] --> s4["Verify Params (quiz.params)"]
   end
 
   %% ====== BUILD (VECTOR STORE) ======
-  subgraph B[Build Vector Store uses build]
-    B0{"build enabled?"}
-    B0 -->|yes| B1[Download PDF Bundle (--bundle-url)]
-    B0 -->|no| P0
-    B1 --> B2[Extract PDFs]
-    B2 --> B3[Derive H1 (first real line or title)]
-    B3 --> B4[Split to Chunks (chunk_size / chunk_overlap)]
-    B4 --> B5{"Embeddings Mode"}
-    B5 -->|local=true| B6[Local Embeddings (HF model)]
-    B5 -->|openai=true| B7[OpenAI Embeddings (OPENAI_API_KEY)]
-    B6 --> B8[Persist to Chroma (persist dir)]
-    B7 --> B8
+  subgraph build["Build Vector Store uses build"]
+    b0{"build enabled?"}
+    b0 -->|yes| b1["Download PDF Bundle (--bundle-url)"]
+    b0 -->|no| p0
+    b1 --> b2["Extract PDFs"]
+    b2 --> b3["Derive H1 (first real line or title)"]
+    b3 --> b4["Split to Chunks (chunk_size / chunk_overlap)"]
+    b4 --> b5{"Embeddings Mode"}
+    b5 -->|local=true| b6["Local Embeddings (HF model)"]
+    b5 -->|openai=true| b7["OpenAI Embeddings (OPENAI_API_KEY)"]
+    b6 --> b8["Persist to Chroma (persist dir)"]
+    b7 --> b8
   end
 
   %% ====== PREPARE (QUIZ GENERATION) ======
-  subgraph P[Prepare Quiz uses prepare and prepare.rag]
-    P0[Load Params (provider/model, rag_k, files)]
-    P1{"Provider?"}
-    P1 -->|ollama| P2[Connect Ollama]
-    P1 -->|ai| P3[Use OpenAI API]
-    P2 --> P4
-    P3 --> P4
-    P4[For each Question (count)] --> P5{"Select Tag"}
-    P5 -->|include_tags set| P6[Use provided tag(s)]
-    P5 -->|else| P7[Choose random tag per question]
-    P6 --> P8
-    P7 --> P8
-    P8[Retrieve top-k Chunks from Chroma by tag/H1] --> P9[Compose Prompt]
-    P9 --> P10[LLM Generate Q/A/Expl]
-    P10 --> P11[Validate Structure (count, options, letter)]
-    P11 --> P12[Accumulate]
+  subgraph prepare["Prepare Quiz uses prepare and prepare.rag"]
+    p0["Load Params (provider/model, rag_k, files)"]
+    p1{"Provider?"}
+    p1 -->|ollama| p2["Connect Ollama"]
+    p1 -->|ai| p3["Use OpenAI API"]
+    p2 --> p4
+    p3 --> p4
+    p4["For each Question (count)"] --> p5{"Select Tag"}
+    p5 -->|include_tags set| p6["Use provided tag(s)"]
+    p5 -->|else| p7["Choose random tag per question"]
+    p6 --> p8
+    p7 --> p8
+    p8["Retrieve top-k Chunks from Chroma by tag/H1"] --> p9["Compose Prompt"]
+    p9 --> p10["LLM Generate Q/A/Expl"]
+    p10 --> p11["Validate Structure (count, options, letter)"]
+    p11 --> p12["Accumulate"]
   end
 
   %% ====== OUTPUTS & VALIDATION ======
-  subgraph O[Outputs & Validation]
-    O1[Write quiz.json and answer_key.json]
-    O2{"Validation Path"}
-    O2 -->|Answer Key| O3[./master.py validate]
-    O2 -->|Manual Marking| O4[./master.py export] --> O5[Edit quiz.txt] --> O6[./master.py parse] --> O3
+  subgraph outputs["Outputs & Validation"]
+    o1["Write quiz.json and answer_key.json"]
+    o2{"Validation Path"}
+    o2 -->|Answer Key| o3["./master.py validate"]
+    o2 -->|Manual Marking| o4["./master.py export"] --> o5["Edit quiz.txt"] --> o6["./master.py parse"] --> o3
   end
 
   %% ====== WIRES ======
-  S --> B0
-  B8 --> P0
-  P12 --> O1 --> O2
+  setup --> b0
+  b8 --> p0
+  p12 --> o1 --> o2
 ```
 
 ---
