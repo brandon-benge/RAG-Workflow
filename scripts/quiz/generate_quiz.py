@@ -600,7 +600,8 @@ class Providers:
             "Requirements: "
             "- 'options' MUST be a list of exactly 4 distinct answer choices. "
             "- 'answer' MUST be a single letter A/B/C/D matching the position in the options list (0=A, 1=B, 2=C, 3=D). "
-            "- You may also include 'answer_letter' as the same letter. "
+            "- The explanation MUST clearly state which option is correct and why. "
+            "- Double-check that the answer letter matches the correct option referenced in the explanation. "
             "- Do NOT put option text in 'answer'. "
             "Return ONLY a single strict JSON object for the question, no array, no markdown, no extra text.\n"
             f"\nUniqueness token: {token}. Create ONE multiple choice question (ID Q{iteration+1 if iteration is not None else 1}) about system design or devops using ONLY the provided notes.\n"
@@ -645,6 +646,7 @@ class Providers:
                 "Return JSON {\"correct\":bool, \"correct_answer\":\"A-D\"}.\n"
                 "For each option, ensure it does NOT start with a letter (A, B, C, D) followed by punctuation (such as ':', ')', '.', '-', or whitespace). "
                 "If any option starts this way, remove the letter and punctuation so only the answer text remains. "
+                "If more than 4 options are present, remove one or more options that are NOT the correct answer so only 4 remain (the correct answer and the most plausible distractors). "
                 "Each element in the array is a position in the options list (0=A, 1=B, 2=C, 3=D) but do not need to be labeled. "
                 f"Raw LLM response: {json_text}\n"
             )
