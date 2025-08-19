@@ -8,3 +8,4 @@
 patch.diff
 ./*.txt
 ./*.json
+.chroma/chroma.sqlite3

@@ -120,7 +120,7 @@ Set `provider=ai` and `model=<openai-model>` in `[prepare]` of `quiz.params`, ex
 **Advanced Options**
 
 - Change model: set `provider` and `model` in `[prepare]` (e.g., `provider=ollama`, `model=mistral`)
-- Improve novelty: set `fresh=true` in `[prepare]`
+- Control novelty / avoid duplicates: set `avoid_recent_window=<N>` in `[prepare]` (required; N is the number of previous questions to avoid repeating)
 - Retrieval depth: set `rag_k` in `[prepare]`
 - Filtering: set `include_tags`, `include_h1`, and `restrict_sources` in `[prepare.rag]`
 
@@ -164,6 +164,7 @@ This will prompt you for each question and provide immediate feedback.
 | Ollama   | `quiz.params`  | Primary      | Offline / fast iteration / zero API cost; configured via `[prepare]` |
 
 > **Accuracy Note (Ollama):** Local models may occasionally produce mismatches (e.g. the answer letter not conceptually matching the best option, weak explanations, or subtly duplicated stems). Validate logically.  If a question looks off: (1) re‑run with `fresh=true` in params; (2) adjust retrieval filters; or (3) manually correct.  The validator checks structure, not semantic truth.  OpenAI path can yield different style but is optional/experimental.
+> **Accuracy Note (Ollama):** Local models may occasionally produce mismatches (e.g. the answer letter not conceptually matching the best option, weak explanations, or subtly duplicated stems). Validate logically.  If a question looks off: (1) re‑run with a larger `avoid_recent_window` in params; (2) adjust retrieval filters; or (3) manually correct.  The validator checks structure, not semantic truth.  OpenAI path can yield different style but is optional/experimental.
 
 ## Offline‑First Philosophy
 
@@ -239,7 +240,7 @@ quiz=quiz.json
 answers=answer_key.json
 rag_persist=.chroma        # Path to the vector store to use for retrieval
 rag_k=3
-fresh=true
+avoid_recent_window=5
 rag_local=true
 rag_openai=false
 
@@ -279,7 +280,7 @@ If you need to benchmark raw behavior or inspect model output without context, c
 | 0 questions returned | Model output malformed | Re-run; ensure model supports instruction following |
 | Validation failed: count mismatch | Model produced fewer items | Re-run; sometimes temperature / truncation issues |
 | OPENAI_API_KEY error | Env var missing | Only needed for experimental OpenAI path; `export OPENAI_API_KEY=sk-...` |
-| Question seems wrong / answer dubious (Ollama) | Model hallucination | Re-run with `fresh=true` in params; switch provider; manual edit |
+| Question seems wrong / answer dubious (Ollama) | Model hallucination | Re-run with a larger `avoid_recent_window` in params; switch provider; manual edit |
 
 ## Example Snippet
 

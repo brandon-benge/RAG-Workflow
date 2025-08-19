@@ -17,10 +17,12 @@ quiz=quiz.json
 answers=answer_key.json
 rag_persist=.chroma
 rag_k=5
-fresh=true
-verify=false
+avoid_recent_window=5
+verify=true
 rag_local=true
 rag_openai=false
+dump_llm_payload=none
+dump_llm_response=llm_response.json
 
 [export]
 quiz=quiz.json

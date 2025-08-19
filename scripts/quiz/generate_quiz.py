@@ -92,11 +92,11 @@ class Config:
     ollama_compact_json: bool
     debug_ollama_payload: bool
     dump_ollama_prompt: Optional[str]
-    dump_ollama_payload: Optional[str]
     dump_llm_payload: Optional[str]
+    dump_llm_response: Optional[str]
     template: bool
     seed: int
-    fresh: bool
+    avoid_recent_window: int
     verify: bool
     dry_run: bool
     # RAG
@@ -136,13 +136,13 @@ def parse_args(argv: List[str]) -> Config:
     p.add_argument('--ollama-compact-json', action='store_true')
     p.add_argument('--debug-ollama-payload', action='store_true')
     p.add_argument('--dump-ollama-prompt')
-    p.add_argument('--dump-ollama-payload')
     p.add_argument('--dump-llm-payload')
+    p.add_argument('--dump-llm-response')
 
     # Flow
     p.add_argument('--template', action='store_true')
     p.add_argument('--seed', type=int, default=0)
-    p.add_argument('--fresh', action='store_true')
+    p.add_argument('--avoid-recent-window', type=int, required=True, help='Avoid reusing the last N questions (required int argument)')
     p.add_argument('--verify', action='store_true')
     p.add_argument('--dry-run', action='store_true')
 
@@ -182,11 +182,11 @@ def parse_args(argv: List[str]) -> Config:
         ollama_compact_json=a.ollama_compact_json,
         debug_ollama_payload=a.debug_ollama_payload,
         dump_ollama_prompt=a.dump_ollama_prompt,
-        dump_ollama_payload=a.dump_ollama_payload,
         dump_llm_payload=a.dump_llm_payload,
+        dump_llm_response=a.dump_llm_response,
         template=a.template,
         seed=a.seed,
-        fresh=a.fresh,
+        avoid_recent_window=a.avoid_recent_window,
         verify=a.verify,
         dry_run=a.dry_run,
         rag_persist=a.rag_persist,
@@ -201,6 +201,7 @@ def parse_args(argv: List[str]) -> Config:
         include_h1=a.include_h1,
         dump_rag_context=a.dump_rag_context,
     )
+    avoid_recent_window: int
 
 # =========================
 # File IO Helpers
@@ -337,152 +338,89 @@ def template_questions(files: Dict[str, str], count: int, seed: int) -> List[Que
 
 def _parse_model_questions(raw_json: str, provider: str) -> List[Question]:
     """Robustly parse LLM JSON for several shapes."""
-    def _to_list(data: Any) -> List[Dict[str, Any]]:
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            if isinstance(data.get('questions'), list):
-                return data['questions']
-            if isinstance(data.get('data'), list):
-                return data['data']
-            if all(isinstance(v, dict) for v in data.values()):
-                items = []
-                for k, v in data.items():
-                    vv = dict(v)
-                    vv.setdefault('id', k)
-                    items.append(vv)
-                return items
-            return [data]
-        raise RuntimeError(f'{provider}: unexpected JSON shape')
-
+    # Only accept a list of dicts as the top-level JSON
     try:
         data = json.loads(raw_json)
-    except Exception as e:
-        m = re.search(r'(\[\s*{.*}\s*\])', raw_json, re.DOTALL)
-        if not m:
-            raise RuntimeError(f'{provider}: could not parse JSON: {e}')
-        data = json.loads(m.group(1))
-
-    items = _to_list(data)
-    out: List[Question] = []
-
-    def format_options(options):
-        """
-        Robustly handles options that may be:
-        - a list of strings (each option)
-        - a single string with embedded newlines
-        - a list with one string containing embedded newlines
-        Returns a list of clean option strings.
-        """
-        import re
-        def split_by_letters(text):
-            # Split on A), B), C), D) or similar patterns
-            pattern = r'([A-D][\)\.\:]\s*)'
-            parts = re.split(pattern, text)
-            result = []
-            buffer = ''
-            for part in parts:
-                if re.match(pattern, part):
-                    if buffer:
-                        result.append(buffer.strip())
-                    buffer = part
-                else:
-                    buffer += part
-            if buffer:
-                result.append(buffer.strip())
-            # Clean up: remove leading A), B), etc. and also any leading numbers/letters and punctuation
-            return [re.sub(r'^[A-Da-d0-9][\)\.\:]\s*', '', opt).strip() for opt in result if opt.strip()]
-
-        if isinstance(options, list):
-            result = []
-            for opt in options:
-                if isinstance(opt, str):
-                    # If option contains all choices, split by letters
-                    if re.search(r'[A-D][\)\.\:]', opt):
-                        result.extend(split_by_letters(opt))
-                    else:
-                        result.extend([o.strip() for o in opt.split('\n') if o.strip()])
-            return result
-        elif isinstance(options, str):
-            if re.search(r'[A-D][\)\.\:]', options):
-                return split_by_letters(options)
-            return [opt.strip() for opt in options.split('\n') if opt.strip()]
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict) and provider == 'ollama':
+            items = [data]
         else:
-            return []
+            raise RuntimeError(f'{provider}: expected a list of questions, got {type(data)}')
+        out: List[Question] = []
 
-    for idx, obj in enumerate(items, start=1):
-        if not isinstance(obj, dict):
-            continue
+        def format_options(options):
+            """
+            Robustly handles options that may be:
+            - a list of strings (each option)
+            - a single string with embedded newlines
+            - a list with one string containing embedded newlines
+            Returns a list of clean option strings.
+            """
+            # Only accept a list of strings
+            if isinstance(options, list) and all(isinstance(opt, str) for opt in options):
+                return [opt.strip() for opt in options]
+            raise RuntimeError('Options must be a list of strings')
 
-        qid = str(obj.get('id') or f'Q{idx}')
-        question = (obj.get('question') or '').strip() or f'Placeholder question {idx}'
+        for idx, obj in enumerate(items, start=1):
+            if not isinstance(obj, dict):
+                continue
 
-        raw_opts = obj.get('options')
-        if not isinstance(raw_opts, list):
-            cand = []
-            for key in ['a', 'b', 'c', 'd', 'A', 'B', 'C', 'D']:
-                if key in obj:
-                    cand.append(str(obj[key]))
-            if not cand:
-                cand = ['Option A', 'Option B', 'Option C', 'Option D']
-            raw_opts = cand
-        options = format_options(raw_opts)[:4]
-        while len(options) < 4:
-            options.append(f'Extra {len(options)+1}')
+            qid = str(obj.get('id') or f'Q{idx}')
+            question = (obj.get('question') or '').strip() or f'Placeholder question {idx}'
 
-        # Prefer an explicit answer_letter if provided; otherwise map the answer.
-        answer_letter: Optional[str] = None
-        explicit_letter = str(obj.get('answer_letter', '')).strip().upper()
-        if explicit_letter in ['A', 'B', 'C', 'D']:
-            answer_letter = explicit_letter
-        else:
-            answer_raw = str(obj.get('answer', 'A')).strip()
-            if answer_raw.upper() in ['A', 'B', 'C', 'D']:
-                answer_letter = answer_raw.upper()
+            raw_opts = obj.get('options')
+            options = format_options(raw_opts)
+
+            # Accept either 'answer_letter' or 'answer' as a single letter
+            explicit_letter = str(obj.get('answer_letter', '')).strip().upper()
+            answer_field = str(obj.get('answer', '')).strip().upper()
+            if explicit_letter in ['A', 'B', 'C', 'D']:
+                answer_letter = explicit_letter
+            elif answer_field in ['A', 'B', 'C', 'D']:
+                answer_letter = answer_field
             else:
-                # exact match
-                for i, opt in enumerate(options):
-                    if answer_raw.lower() == opt.lower():
-                        answer_letter = chr(ord('A') + i)
-                        break
-                # prefix / loose match
-                if answer_letter is None:
-                    for i, opt in enumerate(options):
-                        if opt.lower().startswith(answer_raw.lower()[:5]):
-                            answer_letter = chr(ord('A') + i)
-                            break
+                raise RuntimeError("answer or answer_letter must be one of A, B, C, D")
 
-                # If still no match, replace a random option with the model's answer
-                if answer_letter is None and answer_raw:
-                    import random as _rand
-                    idx_replace = _rand.randint(0, 3)
-                    options[idx_replace] = answer_raw
-                    answer_letter = chr(ord('A') + idx_replace)
-                    # annotate explanation to make this transparent
-                    note = (
-                        f" [Note: original answer '{answer_raw}' was not in options; "
-                        f"replaced option {answer_letter} accordingly]"
-                    )
-                    obj_expl = (obj.get('explanation') or '').strip()
-                    obj['explanation'] = (obj_expl + note) if obj_expl else note
+            topic = (obj.get('topic') or 'General').strip() or 'General'
+            difficulty = (obj.get('difficulty') or 'medium').strip() or 'medium'
+            explanation = (obj.get('explanation') or '').strip()
 
-        topic = (obj.get('topic') or 'General').strip() or 'General'
-        difficulty = (obj.get('difficulty') or 'medium').strip() or 'medium'
-        explanation = (obj.get('explanation') or '').strip()
+            out.append(Question(
+                id=qid,
+                question=question,
+                options=options,
+                topic=topic,
+                difficulty=difficulty,
+                answer=answer_letter,
+                explanation=explanation
+            ))
 
-        out.append(Question(
-            id=qid,
-            question=question,
-            options=options,
-            topic=topic,
-            difficulty=difficulty,
-            answer=answer_letter,
-            explanation=explanation
-        ))
-
-    if not out:
-        raise RuntimeError(f'{provider}: no questions parsed from model output')
-    return out
+        if not out:
+            raise RuntimeError(f'{provider}: no questions parsed from model output')
+        return out
+    except Exception as e:
+        # Log the error before dumping the payload
+        from pathlib import Path
+        import inspect
+        log("error", f"LLM output parsing failed: {e}")
+        cfg = None
+        # Try to get cfg from caller's frame
+        for frame in inspect.stack():
+            if 'self' in frame.frame.f_locals:
+                self_obj = frame.frame.f_locals['self']
+                if hasattr(self_obj, 'cfg'):
+                    cfg = getattr(self_obj, 'cfg')
+                    break
+        path = None
+        if cfg:
+            path = getattr(cfg, 'dump_llm_payload', None)
+        if path:
+            try:
+                Path(path).write_text(raw_json, encoding='utf-8')
+            except Exception:
+                pass
+        raise
 
 # =========================
 # Providers
@@ -495,6 +433,22 @@ class Providers:
         self._OpenAIClient = None
         self._openai_client = None
         self._requests = None
+
+        import shutil
+        import tempfile
+
+        # Move existing dump files to temp directory on startup
+        for attr in ['dump_llm_payload', 'dump_llm_response']:
+            path = getattr(cfg, attr, None)
+            if path and os.path.isfile(path):
+                temp_dir = tempfile.gettempdir()
+                base = os.path.basename(path)
+                new_path = os.path.join(temp_dir, f"{base}.bak")
+                try:
+                    shutil.move(path, new_path)
+                    log("info", f"Moved existing {base} to {new_path}")
+                except Exception as e:
+                    log("warn", f"Could not move {base}: {e}")
 
         try:
             import requests  # type: ignore
@@ -517,22 +471,33 @@ class Providers:
         except Exception:
             pass
 
-    def _dump_payload(self, prompt: str, payload: dict) -> None:
+    def _dump_payload(self, prompt: str, payload: dict, response: Optional[Any] = None) -> None:
         if self.cfg.dump_ollama_prompt:
             try:
                 Path(self.cfg.dump_ollama_prompt).write_text(prompt, encoding='utf-8')
                 log("debug", f"Wrote full LLM prompt -> {self.cfg.dump_ollama_prompt}")
             except Exception as e:
                 log("warn", f"Could not write prompt: {e}")
-        path = self.cfg.dump_llm_payload or self.cfg.dump_ollama_payload
+        path = self.cfg.dump_llm_payload
         if path:
             try:
-                Path(path).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding='utf-8')
-                log("debug", f"Wrote LLM payload -> {path}")
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+                log("debug", f"Appended LLM payload -> {path}")
             except Exception as e:
-                log("warn", f"Could not write payload: {e}")
-
-    # --- OpenAI ---
+                log("warn", f"Could not append payload: {e}")
+        resp_path = self.cfg.dump_llm_response
+        if resp_path and response is not None:
+            try:
+                try:
+                    text = json.dumps(response, indent=2, ensure_ascii=False)
+                except Exception:
+                    text = str(response)
+                with open(resp_path, "a", encoding="utf-8") as f:
+                    f.write(text + "\n")
+                log("debug", f"Appended LLM response -> {resp_path}")
+            except Exception as e:
+                log("warn", f"Could not append LLM response: {e}")
 
     def openai_questions(self, files: Dict[str, str], count: int, model: str,
                          token: str, recent_norm: List[str], temperature: float, *, iteration: Optional[int] = None) -> List[Question]:
@@ -553,15 +518,21 @@ class Providers:
             total += len(part)
         corpus = ''.join(parts)
 
-        recent_clause = ("Avoid reusing these prior question phrasings: " + '; '.join(recent_norm[:30])) if recent_norm else ''
+        window = self.cfg.avoid_recent_window
+        recent_clause = ("Avoid reusing these prior question phrasings: " + '; '.join(recent_norm[-window:])) if recent_norm else ''
         system = (
             "You are an assistant that creates high-quality multiple-choice quiz questions for system design and devops. "
-            "If citation lines like 'C<number>:' exist, you MUST base questions on them, pick a concise Title Case topic, "
-            "and return STRICT JSON with: id, question, options(4), topic, difficulty, answer, explanation. "
-            "The 'answer' MUST be a single letter A/B/C/D corresponding to the provided options; you may also include 'answer_letter' as the same letter."
+            "If citation lines like 'C<number>:' exist, you MUST base questions on them. "
+            "Pick a concise Title Case topic. "
+            "Return STRICT JSON with: id, question, options (list of 4), topic, difficulty, answer, explanation. "
+            "The 'answer' MUST be a single letter A/B/C/D corresponding to the provided options; you may also include 'answer_letter' as the same letter. "
+            "Do NOT put option text in 'answer'. "
+            "Return ONLY a single strict JSON object for each question, no array, no markdown, no extra text."
         )
-        user = (f"Uniqueness token: {token}. Generate {count} questions (IDs Q1..Q{count}). "
-                f"{recent_clause} Source material: {corpus[:12000]}")
+        user = (
+            f"Uniqueness token: {token}. Generate {count} questions (IDs Q1..Q{count}). "
+            f"{recent_clause} Source material: {corpus[:12000]}"
+        )
 
         start = time.time()
         if self._openai_client:
@@ -589,12 +560,11 @@ class Providers:
 
         m = re.search(r"```json\n(.*)```", content, re.DOTALL)
         json_text = m.group(1) if m else content
+        self._dump_payload(system + '\n' + user, {'model': model, 'messages': [{'role': 'system', 'content': system}, {'role': 'user', 'content': user}], 'temperature': temperature}, raw_response)
         questions = _parse_model_questions(json_text, provider='openai')
         for q in questions:
             q.raw_response = raw_response
         return questions
-
-    # --- Ollama ---
 
     def ollama_questions(self, files: Dict[str, str], count: int, model: str,
                          token: str, recent_norm: List[str], temperature: float,
@@ -618,16 +588,23 @@ class Providers:
             total += len(part)
         corpus = ''.join(parts)
 
-        recent_clause = ("Avoid reusing these prior question phrasings: " + '; '.join(recent_norm[:30])) if recent_norm else ''
+        window = self.cfg.avoid_recent_window
+        recent_clause = ("Avoid reusing these prior question phrasings: " + '; '.join(recent_norm[-window:])) if recent_norm else ''
         style_clause = 'Return STRICT COMPACT JSON array ONLY.' if compact_json else 'Return STRICT JSON as an array.'
         prompt = (
-            f"Uniqueness token: {token}. Create {count} multiple choice questions (IDs Q1..Q{count}) "
-            "about system design and devops using ONLY the provided notes.\n"
+            "You are an assistant that creates high-quality multiple-choice quiz questions for system design and devops. "
+            "If citation lines like 'C<number>:' exist, you MUST base questions on them. "
+            "Pick a concise Title Case topic. "
+            "NEVER use 'RAG_CONTEXT' as a topic. "
+            f"{style_clause} Keys: id, question, options (list of 4), topic, difficulty, answer, explanation. "
+            "Requirements: "
+            "- 'options' MUST be a list of exactly 4 distinct answer choices. "
+            "- 'answer' MUST be a single letter A/B/C/D matching the position in the options list (0=A, 1=B, 2=C, 3=D). "
+            "- You may also include 'answer_letter' as the same letter. "
+            "- Do NOT put option text in 'answer'. "
+            "Return ONLY a single strict JSON object for the question, no array, no markdown, no extra text.\n"
+            f"\nUniqueness token: {token}. Create ONE multiple choice question (ID Q{iteration+1 if iteration is not None else 1}) about system design or devops using ONLY the provided notes.\n"
             f"{recent_clause}\n"
-            "If a citation directory is present, ground each question in those sections, pick a concise Title Case topic, "
-            "NEVER use 'RAG_CONTEXT' as a topic.\n"
-            f"{style_clause} Keys: id, question, options, topic, difficulty, answer, explanation. "
-            "The 'answer' MUST be a single letter A/B/C/D matching the options; you may also include 'answer_letter' as the same letter. Do NOT put option text in 'answer'.\n"
             "Source notes:\n" + (corpus if corpus_chars == -1 else corpus[:corpus_chars])
         )
 
@@ -636,7 +613,9 @@ class Providers:
         if top_k is not None: options['top_k'] = top_k
         if top_p is not None: options['top_p'] = top_p
         payload = {'model': model, 'prompt': prompt, 'stream': False, 'options': options}
-        self._dump_payload(prompt, payload)
+
+        # Dump prompt/payload before the request (no response yet)
+        self._dump_payload(prompt, payload, None)
 
         if debug_payload:
             trunc = prompt[:600] + (f"... [truncated, total {len(prompt)} chars]" if len(prompt) > 600 else "")
@@ -659,10 +638,43 @@ class Providers:
         theme_str = f", theme: {theme}" if theme else ""
         log("info", f"{iter_str}LLM response time (ollama {model}{theme_str}): {duration:.2f}s")
 
+        # Optional verification step
+        if self.cfg.verify:
+            verify_prompt = (
+                "Verify the correctness of the provided answer letter. "
+                "Return JSON {\"correct\":bool, \"correct_answer\":\"A-D\"}.\n"
+                "For each option, ensure it does NOT start with a letter (A, B, C, D) followed by punctuation (such as ':', ')', '.', '-', or whitespace). "
+                "If any option starts this way, remove the letter and punctuation so only the answer text remains. "
+                "Each element in the array is a position in the options list (0=A, 1=B, 2=C, 3=D) but do not need to be labeled. "
+                f"Raw LLM response: {json_text}\n"
+            )
+            try:
+                verify_resp = self._requests.post(
+                    OLLAMA_URL,
+                    json={'model': model, 'prompt': verify_prompt, 'stream': False, 'options': {'temperature': 0.0}},
+                    timeout=VERIFY_HTTP_TIMEOUT
+                )
+                if verify_resp.status_code == 200:
+                    verify_data = verify_resp.json().get('response', '')
+                    m2 = re.search(r"```json\n(.*)```", verify_data, re.DOTALL)
+                    payload2 = m2.group(1) if m2 else verify_data
+                    js = json.loads(payload2)
+                    if isinstance(js, dict) and not js.get('correct', True):
+                        new_ans = js.get('correct_answer')
+                        if new_ans in ['A','B','C','D']:
+                            json_text = re.sub(r'("answer"\s*:\s*")[A-D](")', f'"answer":"{new_ans}"', json_text)
+                            log("info", f"Verification adjusted answer to {new_ans}.")
+            except Exception:
+                pass
+
+        # Dump request/response after receiving data
+        self._dump_payload(prompt, payload, data)
+
         questions = _parse_model_questions(json_text, provider='ollama')
         for q in questions:
-            q.raw_response = data  # keep the entire dict (includes context if present)
+            q.raw_response = data
         return questions
+
 
 # =========================
 # RAG
@@ -862,19 +874,19 @@ class Quiz:
         self.rag = RAG(cfg)
 
     def _recent_history(self) -> List[str]:
-        if not self.cfg.fresh or not HISTORY_FILE.exists():
+        if not HISTORY_FILE.exists():
             return []
         try:
             loaded = json.loads(HISTORY_FILE.read_text(encoding='utf-8'))
             if isinstance(loaded, list):
-                return [re.sub(r'\s+', ' ', q.lower()).strip() for q in loaded][-80:]
+                # Only return the last N questions, where N is avoid_recent_window
+                return [re.sub(r'\s+', ' ', q.lower()).strip() for q in loaded][-self.cfg.avoid_recent_window:]
         except Exception:
             pass
         return []
 
     def _save_history(self, questions: List[Question]) -> None:
-        if not self.cfg.fresh:
-            return
+        # Always save history for recent question avoidance
         try:
             items = [re.sub(r'\s+', ' ', q.question.lower()).strip() for q in questions]
             if HISTORY_FILE.exists():
@@ -934,7 +946,7 @@ class Quiz:
         recent_norm = self._recent_history()
 
         provider = 'ollama' if self.cfg.ollama else 'openai'
-        base_temp = 0.6 if self.cfg.fresh else 0.4
+        base_temp = 0.4  # Use a fixed base temperature; remove fresh logic
         temperature = self.cfg.ollama_temperature if (self.cfg.ollama and self.cfg.ollama_temperature is not None) else base_temp
 
         questions: List[Question] = []
@@ -967,40 +979,7 @@ class Quiz:
                 q = qlist[0]
                 q.id = f"Q{idx+1}"
                 questions.append(q)
-
-        # Optional verify with Ollama
-        if self.cfg.verify and provider == 'ollama' and self.providers._requests:
-            corrected = 0
-            for q in questions:
-                verify_prompt = (
-                    "Verify the correctness of the provided answer letter. "
-                    "Return JSON {\"correct\":bool, \"correct_answer\":\"A-D\"}.\n"
-                    f"Question: {q.question}\n"
-                    f"A. {q.options[0]}\nB. {q.options[1]}\nC. {q.options[2]}\nD. {q.options[3]}\n"
-                    f"Current answer: {q.answer}\n"
-                )
-                try:
-                    resp = self.providers._requests.post(
-                        OLLAMA_URL,
-                        json={'model': self.cfg.ollama_model, 'prompt': verify_prompt, 'stream': False, 'options': {'temperature': 0.0}},
-                        timeout=VERIFY_HTTP_TIMEOUT
-                    )
-                    if resp.status_code != 200:
-                        continue
-                    data = resp.json().get('response', '')
-                    m = re.search(r"```json\n(.*)```", data, re.DOTALL)
-                    payload = m.group(1) if m else data
-                    js = json.loads(payload)
-                    if isinstance(js, dict) and not js.get('correct', True):
-                        new_ans = js.get('correct_answer')
-                        if new_ans in ['A','B','C','D'] and new_ans != q.answer:
-                            q.answer = new_ans
-                            corrected += 1
-                except Exception:
-                    pass
-            if corrected:
-                log("info", f"Verification adjusted {corrected} answer(s).")
-
+        # Verification now handled in Providers.ollama_questions before parsing.
         return questions, files_ctx
 
 # =========================

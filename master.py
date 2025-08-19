@@ -12,15 +12,18 @@ def log(level: str, msg: str) -> None:
 
 # Read config params
 def load_params(params_path: Path) -> configparser.ConfigParser:
+    log('info', f"Loading config params from: {params_path}")
     if not params_path.exists():
         log('error', f"Params file not found: {params_path}")
         sys.exit(1)
     cfg = configparser.ConfigParser()
     cfg.read(params_path)
+    log('info', f"Config loaded. Sections found: {cfg.sections()}")
     return cfg
 
 # Require keys from section
 def require_keys(section: str, cfg: configparser.ConfigParser, keys: List[str]) -> dict:
+    log('info', f"Checking for section [{section}] and required keys: {keys}")
     if section not in cfg:
         log('error', f"Missing section [{section}] in params file")
         sys.exit(1)
@@ -29,7 +32,9 @@ def require_keys(section: str, cfg: configparser.ConfigParser, keys: List[str]) 
         if k not in cfg[section]:
             log('error', f"Missing key '{k}' in section [{section}]")
             sys.exit(1)
+        log('info', f"Found key '{k}' in section [{section}]: {cfg[section][k]}")
         out[k] = cfg[section][k]
+    log('info', f"All required keys found for section [{section}]. Returning values.")
     return out
 
 # Bool parser
@@ -38,11 +43,15 @@ def bool_true(v: str) -> bool:
 
 # Dispatch based on subcommand
 def dispatch(argv: List[str]) -> Optional[int]:
+    log('info', f"Entered dispatch with argv: {argv}")
     if not argv:
+        log('warning', 'No subcommand provided to dispatch.')
         return None
 
     repo_root = Path(__file__).resolve().parent
+    log('info', f"Resolved repo_root: {repo_root}")
     params_path = repo_root / 'quiz.params'
+    log('info', f"Using params_path: {params_path}")
     cfg = load_params(params_path)
 
     sub = argv[0].lower()
@@ -96,7 +105,7 @@ def dispatch(argv: List[str]) -> Optional[int]:
 
     elif sub == 'prepare':
         # Directly run generate_quiz.py with its own section in quiz.params
-        req = require_keys('prepare', cfg, ['count','quiz','answers','rag_persist','rag_k','provider','model','fresh','rag_local','rag_openai'])
+        req = require_keys('prepare', cfg, ['count','quiz','answers','rag_persist','rag_k','provider','model','avoid_recent_window','verify','rag_local','rag_openai','dump_llm_payload','dump_llm_response'])
         rag_local = bool_true(req['rag_local'])
         rag_openai = bool_true(req['rag_openai'])
         if rag_local == rag_openai:
@@ -110,10 +119,18 @@ def dispatch(argv: List[str]) -> Optional[int]:
             '--rag-persist', req['rag_persist'],
             '--rag-k', req['rag_k'],
             '--' + req['provider'],
-            '--' + req['provider'] + '-model', req['model']
+            '--' + req['provider'] + '-model', req['model'],
+            '--avoid-recent-window', req['avoid_recent_window']
         ]
-        if bool_true(req['fresh']):
-            args.append('--fresh')
+        # Only add --dump-llm-payload if set and not 'none' or 'false'
+        dump_llm_payload = req.get('dump_llm_payload', '').strip().lower()
+        if dump_llm_payload and dump_llm_payload not in ('none', 'false'):
+            args += ['--dump-llm-payload', req['dump_llm_payload']]
+        dump_llm_response = req.get('dump_llm_response', '').strip().lower()
+        if dump_llm_response and dump_llm_response not in ('none', 'false'):
+            args += ['--dump-llm-response', req['dump_llm_response']]
+        if bool_true(req['verify']):
+            args.append('--verify')
         if rag_openai:
             args.append('--rag-openai')
         else:
@@ -147,9 +164,5 @@ def dispatch(argv: List[str]) -> Optional[int]:
         log('error', f"Unknown subcommand: {sub}")
         return 2
 
-if __name__ == '__main__':
-    rc = dispatch(sys.argv[1:])
-    if rc is None:
-        log('error', 'No subcommand provided. Use: prepare | export | parse | validate')
-        sys.exit(2)
-    sys.exit(rc)
+if __name__ == "__main__":
+    dispatch(sys.argv[1:])
