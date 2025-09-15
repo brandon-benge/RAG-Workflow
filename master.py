@@ -105,7 +105,11 @@ def dispatch(argv: List[str]) -> Optional[int]:
 
     elif sub == 'prepare':
         # Directly run generate_quiz.py with its own section in quiz.params
-        req = require_keys('prepare', cfg, ['count','quiz','answers','rag_persist','rag_k','provider','model','avoid_recent_window','verify','rag_local','rag_openai','dump_llm_payload','dump_llm_response'])
+        req = require_keys('prepare', cfg, [
+            'count','quiz','answers','rag_persist','rag_k','provider','model',
+            'avoid_recent_window','verify','rag_local','rag_openai',
+            'dump_llm_payload','dump_llm_response','max_retries'
+        ])
         rag_local = bool_true(req['rag_local'])
         rag_openai = bool_true(req['rag_openai'])
         if rag_local == rag_openai:
@@ -129,6 +133,10 @@ def dispatch(argv: List[str]) -> Optional[int]:
         dump_llm_response = req.get('dump_llm_response', '').strip().lower()
         if dump_llm_response and dump_llm_response not in ('none', 'false'):
             args += ['--dump-llm-response', req['dump_llm_response']]
+        # Add --max-retries if set and not 'none' or 'false'
+        max_retries = req.get('max_retries', '').strip().lower()
+        if max_retries and max_retries not in ('none', 'false'):
+            args += ['--max-retries', req['max_retries']]
         if bool_true(req['verify']):
             args.append('--verify')
         if rag_openai:

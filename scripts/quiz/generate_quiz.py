@@ -111,6 +111,7 @@ class Config:
     include_tags: Optional[List[str]]
     include_h1: Optional[List[str]]
     dump_rag_context: Optional[str]
+    max_retries: int
 
 def parse_args(argv: List[str]) -> Config:
     p = argparse.ArgumentParser()
@@ -143,6 +144,7 @@ def parse_args(argv: List[str]) -> Config:
     p.add_argument('--template', action='store_true')
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--avoid-recent-window', type=int, required=True, help='Avoid reusing the last N questions (required int argument)')
+    p.add_argument('--max-retries', type=int, default=0, help='Maximum number of retries for LLM output parsing failures')
     p.add_argument('--verify', action='store_true')
     p.add_argument('--dry-run', action='store_true')
 
@@ -200,6 +202,7 @@ def parse_args(argv: List[str]) -> Config:
         include_tags=a.include_tags,
         include_h1=a.include_h1,
         dump_rag_context=a.dump_rag_context,
+        max_retries=a.max_retries,
     )
     avoid_recent_window: int
 
@@ -427,6 +430,89 @@ def _parse_model_questions(raw_json: str, provider: str) -> List[Question]:
 # =========================
 
 class Providers:
+    def _openai_fetch(self, *, model: str, system: str, user: str, temperature: float,
+                      iteration: Optional[int], do_validate: bool) -> Tuple[str, Any, float]:
+        if not self._openai:
+            raise RuntimeError('openai package not available')
+        if not os.getenv('OPENAI_API_KEY') and not self._openai_client:
+            raise RuntimeError('OPENAI_API_KEY not set')
+
+        payload = {
+            'model': model,
+            'messages': [{'role': 'system', 'content': system},
+                         {'role': 'user', 'content': user}],
+            'temperature': temperature
+        }
+        # Dump before request
+        try:
+            self._dump_payload(system + '\n' + user, payload, None)
+        except Exception:
+            pass
+
+        start = time.time()
+        if self._openai_client:
+            resp = self._openai_client.chat.completions.create(**payload)
+            content = resp.choices[0].message.content or ""
+            raw_response: Any = json.loads(resp.model_dump_json())
+        else:
+            self._openai.api_key = os.getenv('OPENAI_API_KEY')
+            resp = self._openai.ChatCompletion.create(**payload)
+            content = resp['choices'][0]['message']['content'] or ""
+            raw_response = json.loads(json.dumps(resp, default=str))
+        duration = time.time() - start
+        iter_str = f"[{(iteration or 0)+1}/{self.cfg.count}] " if iteration is not None else ""
+        log("info", f"{iter_str}LLM response time (openai {model}): {duration:.2f}s")
+
+        m = re.search(r"```json\n(.*)```", content, re.DOTALL)
+        json_text = m.group(1) if m else content
+
+        # Optional verification (triggered by --verify)
+        if do_validate:
+            try:
+                verify_payload = {
+                    'model': model,
+                    'messages': [
+                        {'role': 'system', 'content': "You check multiple-choice question JSON for a correct answer letter."},
+                        {'role': 'user', 'content':
+                            "Verify the correctness of the provided answer letter. "
+                            "Return JSON {\"correct\":bool, \"correct_answer\":\"A-D\"}.\n"
+                            "For each option, ensure it does NOT start with a letter (A, B, C, D) followed by punctuation (such as ':', ')', '.', '-', or whitespace). "
+                            "If any option starts this way, remove the letter and punctuation so only the answer text remains. "
+                            "If more than 4 options are present, remove one or more options that are NOT the correct answer so only 4 remain (the correct answer and the most plausible distractors). "
+                            "Each element in the array is a position in the options list (0=A, 1=B, 2=C, 3=D) but do not need to be labeled. "
+                            f"Raw LLM response: {json_text}\n"
+                        }
+                    ],
+                    'temperature': 0.0
+                }
+                if self._openai_client:
+                    vresp = self._openai_client.chat.completions.create(**verify_payload)
+                    vcontent = vresp.choices[0].message.content or ""
+                else:
+                    self._openai.api_key = os.getenv('OPENAI_API_KEY')
+                    vresp = self._openai.ChatCompletion.create(**verify_payload)
+                    vcontent = vresp['choices'][0]['message']['content'] or ""
+                m2 = re.search(r"```json\n(.*)```", vcontent, re.DOTALL)
+                payload2 = m2.group(1) if m2 else vcontent
+                try:
+                    js = json.loads(payload2)
+                    if isinstance(js, dict) and not js.get('correct', True):
+                        new_ans = js.get('correct_answer')
+                        if new_ans in ['A','B','C','D']:
+                            json_text = re.sub(r'("answer"\s*:\s*")[A-D](")', f'"answer":"{new_ans}"', json_text)
+                            log("info", f"Verification adjusted answer to {new_ans}.")
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # Dump after response
+        try:
+            self._dump_payload(system + '\n' + user, payload, raw_response)
+        except Exception:
+            pass
+
+        return json_text, raw_response, duration
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self._openai = None
@@ -499,13 +585,73 @@ class Providers:
             except Exception as e:
                 log("warn", f"Could not append LLM response: {e}")
 
+    def _ollama_fetch(self, *, model: str, prompt: str, options: Dict[str, Any],
+                      debug_payload: bool, iteration: Optional[int], theme: Optional[str],
+                      do_validate: bool) -> Tuple[str, Any, float]:
+        # Dump prompt/payload before the request (no response yet)
+        payload = {'model': model, 'prompt': prompt, 'stream': False, 'options': options}
+        self._dump_payload(prompt, payload, None)
+
+        if debug_payload:
+            trunc = prompt[:600] + (f"... [truncated, total {len(prompt)} chars]" if len(prompt) > 600 else "")
+            try:
+                log("debug", "Ollama request payload (truncated prompt):")
+                _orig_print(json.dumps({**payload, "prompt": trunc}, indent=2)[:4000])
+            except Exception:
+                pass
+
+        start = time.time()
+        resp = self._requests.post(OLLAMA_URL, json=payload, timeout=DEFAULT_HTTP_TIMEOUT)
+        if resp.status_code != 200:
+            raise RuntimeError(f'Ollama HTTP {resp.status_code}: {resp.text[:200]}')
+        data = resp.json()
+        content = data.get('response', '') or ''
+        m = re.search(r"```json\n(.*)```", content, re.DOTALL)
+        json_text = m.group(1) if m else content
+        duration = time.time() - start
+        iter_str = f"[{(iteration or 0)+1}/{self.cfg.count}] " if iteration is not None else ""
+        theme_str = f", theme: {theme}" if theme else ""
+        log("info", f"{iter_str}LLM response time (ollama {model}{theme_str}): {duration:.2f}s")
+
+        # Optional verification step (triggered by --verify)
+        if do_validate:
+            verify_prompt = (
+                "Verify the correctness of the provided answer letter. "
+                "Return JSON {\"correct\":bool, \"correct_answer\":\"A-D\"}.\n"
+                "For each option, ensure it does NOT start with a letter (A, B, C, D) followed by punctuation (such as ':', ')', '.', '-', or whitespace). "
+                "If any option starts this way, remove the letter and punctuation so only the answer text remains. "
+                "If more than 4 options are present, remove one or more options that are NOT the correct answer so only 4 remain (the correct answer and the most plausible distractors). "
+                "Each element in the array is a position in the options list (0=A, 1=B, 2=C, 3=D) but do not need to be labeled. "
+                f"Raw LLM response: {json_text}\n"
+            )
+            try:
+                verify_resp = self._requests.post(
+                    OLLAMA_URL,
+                    json={'model': model, 'prompt': verify_prompt, 'stream': False, 'options': {'temperature': 0.0}},
+                    timeout=VERIFY_HTTP_TIMEOUT
+                )
+                if verify_resp.status_code == 200:
+                    verify_data = verify_resp.json().get('response', '')
+                    m2 = re.search(r"```json\n(.*)```", verify_data, re.DOTALL)
+                    payload2 = m2.group(1) if m2 else verify_data
+                    try:
+                        js = json.loads(payload2)
+                        if isinstance(js, dict) and not js.get('correct', True):
+                            new_ans = js.get('correct_answer')
+                            if new_ans in ['A','B','C','D']:
+                                json_text = re.sub(r'("answer"\s*:\s*")[A-D](")', f'"answer":"{new_ans}"', json_text)
+                                log("info", f"Verification adjusted answer to {new_ans}.")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # Dump request/response after receiving data
+        self._dump_payload(prompt, payload, data)
+        return json_text, data, duration
+
     def openai_questions(self, files: Dict[str, str], count: int, model: str,
                          token: str, recent_norm: List[str], temperature: float, *, iteration: Optional[int] = None) -> List[Question]:
-        if not self._openai:
-            raise RuntimeError('openai package not available')
-        if not os.getenv('OPENAI_API_KEY') and not self._openai_client:
-            raise RuntimeError('OPENAI_API_KEY not set')
-
         # Build corpus (cap to avoid huge prompts)
         max_chars = 28000
         parts, total = [], 0
@@ -534,37 +680,36 @@ class Providers:
             f"{recent_clause} Source material: {corpus[:12000]}"
         )
 
-        start = time.time()
-        if self._openai_client:
-            resp = self._openai_client.chat.completions.create(
-                model=model,
-                messages=[{"role": "system", "content": system},
-                          {"role": "user", "content": user}],
-                temperature=temperature
-            )
-            content = resp.choices[0].message.content or ""
-            raw_response: Any = json.loads(resp.model_dump_json())
-        else:
-            self._openai.api_key = os.getenv('OPENAI_API_KEY')
-            resp = self._openai.ChatCompletion.create(
-                model=model,
-                messages=[{"role": "system", "content": system},
-                          {"role": "user", "content": user}],
-                temperature=temperature
-            )
-            content = resp['choices'][0]['message']['content'] or ""
-            raw_response = json.loads(json.dumps(resp, default=str))
-        duration = time.time() - start
-        iter_str = f"[{(iteration or 0)+1}/{self.cfg.count}] " if iteration is not None else ""
-        log("info", f"{iter_str}LLM response time (openai {model}): {duration:.2f}s")
+        json_text, raw_response, _ = self._openai_fetch(
+            model=model, system=system, user=user, temperature=temperature,
+            iteration=iteration, do_validate=bool(self.cfg.verify)
+        )
 
-        m = re.search(r"```json\n(.*)```", content, re.DOTALL)
-        json_text = m.group(1) if m else content
-        self._dump_payload(system + '\n' + user, {'model': model, 'messages': [{'role': 'system', 'content': system}, {'role': 'user', 'content': user}], 'temperature': temperature}, raw_response)
-        questions = _parse_model_questions(json_text, provider='openai')
-        for q in questions:
-            q.raw_response = raw_response
-        return questions
+        max_retries = getattr(self.cfg, 'max_retries', 2)
+        attempt = 0
+        while attempt <= max_retries:
+            try:
+                questions = _parse_model_questions(json_text, provider='openai')
+                for q in questions:
+                    q.raw_response = raw_response
+                return questions
+            except Exception as e:
+                log("warn", f"LLM output parsing failed (attempt {attempt+1}/{max_retries+1}): {e}")
+                attempt += 1
+                if attempt <= max_retries:
+                    # Rebuild the user message with a nonce to avoid cached/identical generations
+                    try:
+                        nonce = uuid.uuid4().hex[:8]
+                    except Exception:
+                        nonce = str(int(time.time() * 1000))
+                    user_retry = user + f"\n\n[Retry {attempt} nonce: {nonce}]"
+
+                    json_text, raw_response, _ = self._openai_fetch(
+                        model=model, system=system, user=user_retry, temperature=temperature,
+                        iteration=iteration, do_validate=bool(self.cfg.verify)
+                    )
+                else:
+                    raise
 
     def ollama_questions(self, files: Dict[str, str], count: int, model: str,
                          token: str, recent_norm: List[str], temperature: float,
@@ -613,69 +758,46 @@ class Providers:
         if num_predict is not None: options['num_predict'] = num_predict
         if top_k is not None: options['top_k'] = top_k
         if top_p is not None: options['top_p'] = top_p
-        payload = {'model': model, 'prompt': prompt, 'stream': False, 'options': options}
 
-        # Dump prompt/payload before the request (no response yet)
-        self._dump_payload(prompt, payload, None)
+        json_text, data, _ = self._ollama_fetch(
+            model=model,
+            prompt=prompt,
+            options=options,
+            debug_payload=debug_payload,
+            iteration=iteration,
+            theme=theme,
+            do_validate=bool(self.cfg.verify)
+        )
 
-        if debug_payload:
-            trunc = prompt[:600] + (f"... [truncated, total {len(prompt)} chars]" if len(prompt) > 600 else "")
+        max_retries = getattr(self.cfg, 'max_retries', 2)
+        attempt = 0
+        while attempt <= max_retries:
             try:
-                log("debug", "Ollama request payload (truncated prompt):")
-                _orig_print(json.dumps({**payload, "prompt": trunc}, indent=2)[:4000])
-            except Exception:
-                pass
-
-        start = time.time()
-        resp = self._requests.post(OLLAMA_URL, json=payload, timeout=DEFAULT_HTTP_TIMEOUT)
-        if resp.status_code != 200:
-            raise RuntimeError(f'Ollama HTTP {resp.status_code}: {resp.text[:200]}')
-        data = resp.json()
-        content = data.get('response', '') or ''
-        m = re.search(r"```json\n(.*)```", content, re.DOTALL)
-        json_text = m.group(1) if m else content
-        duration = time.time() - start
-        iter_str = f"[{(iteration or 0)+1}/{self.cfg.count}] " if iteration is not None else ""
-        theme_str = f", theme: {theme}" if theme else ""
-        log("info", f"{iter_str}LLM response time (ollama {model}{theme_str}): {duration:.2f}s")
-
-        # Optional verification step
-        if self.cfg.verify:
-            verify_prompt = (
-                "Verify the correctness of the provided answer letter. "
-                "Return JSON {\"correct\":bool, \"correct_answer\":\"A-D\"}.\n"
-                "For each option, ensure it does NOT start with a letter (A, B, C, D) followed by punctuation (such as ':', ')', '.', '-', or whitespace). "
-                "If any option starts this way, remove the letter and punctuation so only the answer text remains. "
-                "If more than 4 options are present, remove one or more options that are NOT the correct answer so only 4 remain (the correct answer and the most plausible distractors). "
-                "Each element in the array is a position in the options list (0=A, 1=B, 2=C, 3=D) but do not need to be labeled. "
-                f"Raw LLM response: {json_text}\n"
-            )
-            try:
-                verify_resp = self._requests.post(
-                    OLLAMA_URL,
-                    json={'model': model, 'prompt': verify_prompt, 'stream': False, 'options': {'temperature': 0.0}},
-                    timeout=VERIFY_HTTP_TIMEOUT
-                )
-                if verify_resp.status_code == 200:
-                    verify_data = verify_resp.json().get('response', '')
-                    m2 = re.search(r"```json\n(.*)```", verify_data, re.DOTALL)
-                    payload2 = m2.group(1) if m2 else verify_data
-                    js = json.loads(payload2)
-                    if isinstance(js, dict) and not js.get('correct', True):
-                        new_ans = js.get('correct_answer')
-                        if new_ans in ['A','B','C','D']:
-                            json_text = re.sub(r'("answer"\s*:\s*")[A-D](")', f'"answer":"{new_ans}"', json_text)
-                            log("info", f"Verification adjusted answer to {new_ans}.")
-            except Exception:
-                pass
-
-        # Dump request/response after receiving data
-        self._dump_payload(prompt, payload, data)
-
-        questions = _parse_model_questions(json_text, provider='ollama')
-        for q in questions:
-            q.raw_response = data
-        return questions
+                questions = _parse_model_questions(json_text, provider='ollama')
+                for q in questions:
+                    q.raw_response = data
+                return questions
+            except Exception as e:
+                log("warn", f"LLM output parsing failed (attempt {attempt+1}/{max_retries+1}): {e}")
+                attempt += 1
+                if attempt <= max_retries:
+                    # Rebuild a fresh prompt/payload with a nonce to avoid cached/identical generations
+                    try:
+                        nonce = uuid.uuid4().hex[:8]
+                    except Exception:
+                        nonce = str(int(time.time() * 1000))
+                    prompt_retry = prompt + f"\n\n[Retry {attempt} nonce: {nonce}]"
+                    json_text, data, _ = self._ollama_fetch(
+                        model=model,
+                        prompt=prompt_retry,
+                        options=options,
+                        debug_payload=debug_payload,
+                        iteration=iteration,
+                        theme=theme,
+                        do_validate=bool(self.cfg.verify)
+                    )
+                else:
+                    raise
 
 
 # =========================

@@ -23,6 +23,7 @@ rag_local=true
 rag_openai=false
 dump_llm_payload=none
 dump_llm_response=llm_response.json
+max_retries=3
 
 [export]
 quiz=quiz.json
