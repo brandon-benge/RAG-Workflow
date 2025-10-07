@@ -1,40 +1,86 @@
 #!/usr/bin/env python3
 import sys
 import subprocess
-import configparser
 import datetime
+import json
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
+
+# Best-effort import of PyYAML; if missing, try to install it automatically
+def _import_yaml_with_bootstrap() -> Any:
+    try:
+        import yaml  # type: ignore
+        return yaml
+    except Exception:
+        # Attempt to install PyYAML into the current interpreter environment
+        try:
+            args = [sys.executable, '-m', 'pip', 'install', 'PyYAML']
+            # If outside a venv, prefer user install to avoid permission errors
+            try:
+                in_venv = (hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix))
+            except Exception:
+                in_venv = False
+            if not in_venv:
+                args.append('--user')
+            subprocess.run(args, check=False)
+            import yaml  # type: ignore
+            return yaml
+        except Exception:
+            return None
+
+yaml = _import_yaml_with_bootstrap()
 
 # Simple logger
 def log(level: str, msg: str) -> None:
     print(f"[{datetime.datetime.now().isoformat(timespec='seconds')}] [{level}] {msg}")
 
+# Check if params.yaml exists and log its status
+def check_yaml_config(repo_root: Path) -> bool:
+    yaml_path = repo_root / 'params.yaml'
+    if yaml_path.exists():
+        log('info', f"Found YAML config file: {yaml_path}")
+        return True
+    else:
+        log('info', f"YAML config file not found: {yaml_path} (using defaults)")
+        return False
+
 # Read config params
-def load_params(params_path: Path) -> configparser.ConfigParser:
-    log('info', f"Loading config params from: {params_path}")
+def load_yaml(params_path: Path) -> Dict[str, Any]:
+    log('info', f"Loading YAML params from: {params_path}")
     if not params_path.exists():
         log('error', f"Params file not found: {params_path}")
         sys.exit(1)
-    cfg = configparser.ConfigParser()
-    cfg.read(params_path)
-    log('info', f"Config loaded. Sections found: {cfg.sections()}")
-    return cfg
+    if yaml is None:
+        # Minimal fallback: try JSON parse if file happens to be JSON-compatible
+        try:
+            data = json.loads(params_path.read_text(encoding='utf-8'))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            log('error', 'Could not load YAML. Please run ./scripts/bin/run_venv.sh to install dependencies or install PyYAML.')
+            sys.exit(1)
+    data = yaml.safe_load(params_path.read_text(encoding='utf-8'))
+    if not isinstance(data, dict):
+        log('error', 'Invalid YAML structure: expected a top-level mapping')
+        sys.exit(1)
+    return data
 
 # Require keys from section
-def require_keys(section: str, cfg: configparser.ConfigParser, keys: List[str]) -> dict:
-    log('info', f"Checking for section [{section}] and required keys: {keys}")
-    if section not in cfg:
-        log('error', f"Missing section [{section}] in params file")
+def get_build(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    if 'build' not in cfg:
+        log('error', "Missing 'build' section in params.yaml")
         sys.exit(1)
+    b = cfg['build'] or {}
+    must = ['persist','chunk_size','chunk_overlap','model','bundle_url']
     out = {}
-    for k in keys:
-        if k not in cfg[section]:
-            log('error', f"Missing key '{k}' in section [{section}]")
+    for k in must:
+        if k not in b:
+            log('error', f"Missing key '{k}' in build")
             sys.exit(1)
-        log('info', f"Found key '{k}' in section [{section}]: {cfg[section][k]}")
-        out[k] = cfg[section][k]
-    log('info', f"All required keys found for section [{section}]. Returning values.")
+        out[k] = str(b[k])
+        log('info', f"build[{k}] = {out[k]}")
+    out['local'] = bool(str(b.get('local','true')).lower() in ('1','true','yes','y'))
+    out['openai'] = bool(str(b.get('openai','false')).lower() in ('1','true','yes','y'))
+    out['force'] = bool(str(b.get('force','false')).lower() in ('1','true','yes','y'))
     return out
 
 # Bool parser
@@ -50,14 +96,21 @@ def dispatch(argv: List[str]) -> Optional[int]:
 
     repo_root = Path(__file__).resolve().parent
     log('info', f"Resolved repo_root: {repo_root}")
-    params_path = repo_root / 'quiz.params'
+    
+    # Check for YAML configuration file
+    check_yaml_config(repo_root)
+    
+    params_path = repo_root / 'params.yaml'
     log('info', f"Using params_path: {params_path}")
-    cfg = load_params(params_path)
+    cfg = load_yaml(params_path)
 
     sub = argv[0].lower()
     if sub == 'build':
         # Only pre-build vector store
-        if 'build' in cfg and bool_true(cfg['build'].get('enabled','false')):
+        b_enabled = True
+        if 'build' in cfg and isinstance(cfg['build'], dict):
+            b_enabled = bool(str(cfg['build'].get('enabled','true')).lower() in ('1','true','yes','y'))
+        if b_enabled:
             # --- Ollama preflight check ---
             ollama_check = repo_root / 'scripts' / 'rag' / 'check_ollama.py'
             runner = repo_root / 'scripts' / 'bin' / 'run_venv.sh'
@@ -77,9 +130,9 @@ def dispatch(argv: List[str]) -> Optional[int]:
                 log('info', 'Ollama is already running.')
             # --- Continue with build ---
             build_script = repo_root / 'scripts' / 'rag' / 'vector_store_build.py'
-            breq = require_keys('build', cfg, ['persist','chunk_size','chunk_overlap','model','bundle_url'])
-            b_local = bool_true(cfg['build'].get('local','false'))
-            b_openai = bool_true(cfg['build'].get('openai','false'))
+            bvals = get_build(cfg)
+            b_local = bvals['local']
+            b_openai = bvals['openai']
             if b_local == b_openai:
                 log('error', "[build] Exactly one of 'local' or 'openai' must be true")
                 return 1
@@ -88,14 +141,14 @@ def dispatch(argv: List[str]) -> Optional[int]:
                 build_args.append('--local')
             else:
                 build_args.append('--openai')
-            if bool_true(cfg['build'].get('force','false')):
+            if bvals['force']:
                 build_args.append('--force')
             build_args += [
-                '--persist', breq['persist'],
-                '--chunk-size', breq['chunk_size'],
-                '--chunk-overlap', breq['chunk_overlap'],
-                '--model', breq['model'],
-                '--bundle-url', breq['bundle_url'],
+                '--persist', bvals['persist'],
+                '--chunk-size', bvals['chunk_size'],
+                '--chunk-overlap', bvals['chunk_overlap'],
+                '--model', bvals['model'],
+                '--bundle-url', bvals['bundle_url'],
             ]
             cmd = [str(runner), *build_args] if runner.exists() else [sys.executable, *build_args]
             log('info', f"Executing command: {' '.join(cmd)}")
@@ -103,71 +156,11 @@ def dispatch(argv: List[str]) -> Optional[int]:
             return rc
     # No further steps after build; exit after build step
 
-    elif sub == 'prepare':
-        # Directly run generate_quiz.py with its own section in quiz.params
-        req = require_keys('prepare', cfg, [
-            'count','quiz','answers','rag_persist','rag_k','provider','model',
-            'avoid_recent_window','verify','rag_local','rag_openai',
-            'dump_llm_payload','dump_llm_response','max_retries'
-        ])
-        rag_local = bool_true(req['rag_local'])
-        rag_openai = bool_true(req['rag_openai'])
-        if rag_local == rag_openai:
-            log('error', "[prepare] Exactly one of 'rag_local' or 'rag_openai' must be true")
-            return 1
-        args = [
-            str(repo_root / 'scripts' / 'quiz' / 'generate_quiz.py'),
-            '--count', req['count'],
-            '--quiz', req['quiz'],
-            '--answers', req['answers'],
-            '--rag-persist', req['rag_persist'],
-            '--rag-k', req['rag_k'],
-            '--' + req['provider'],
-            '--' + req['provider'] + '-model', req['model'],
-            '--avoid-recent-window', req['avoid_recent_window']
-        ]
-        # Only add --dump-llm-payload if set and not 'none' or 'false'
-        dump_llm_payload = req.get('dump_llm_payload', '').strip().lower()
-        if dump_llm_payload and dump_llm_payload not in ('none', 'false'):
-            args += ['--dump-llm-payload', req['dump_llm_payload']]
-        dump_llm_response = req.get('dump_llm_response', '').strip().lower()
-        if dump_llm_response and dump_llm_response not in ('none', 'false'):
-            args += ['--dump-llm-response', req['dump_llm_response']]
-        # Add --max-retries if set and not 'none' or 'false'
-        max_retries = req.get('max_retries', '').strip().lower()
-        if max_retries and max_retries not in ('none', 'false'):
-            args += ['--max-retries', req['max_retries']]
-        if bool_true(req['verify']):
-            args.append('--verify')
-        if rag_openai:
-            args.append('--rag-openai')
-        else:
-            args.append('--rag-local')
-        runner = repo_root / 'scripts' / 'bin' / 'run_venv.sh'
-        cmd = [str(runner), *args] if runner.exists() else [sys.executable, *args]
-        log('info', f"Executing command: {' '.join(cmd)}")
-        return subprocess.run(cmd).returncode
-    elif sub == 'export':
-        req = require_keys('export', cfg, ['quiz','out'])
-        args = [str(repo_root / 'scripts' / 'quiz' / 'export_quiz_text.py'), '--quiz', req['quiz'], '--out', req['out']]
-        runner = repo_root / 'scripts' / 'bin' / 'run_venv.sh'
-        cmd = [str(runner), *args] if runner.exists() else [sys.executable, *args]
-        log('info', f"Executing command: {' '.join(cmd)}")
-        return subprocess.run(cmd).returncode
-    elif sub == 'parse':
-        req = require_keys('parse', cfg, ['in','out'])
-        args = [str(repo_root / 'scripts' / 'quiz' / 'parse_marked_quiz.py'), '--in', req['in'], '--out', req['out']]
-        runner = repo_root / 'scripts' / 'bin' / 'run_venv.sh'
-        cmd = [str(runner), *args] if runner.exists() else [sys.executable, *args]
-        log('info', f"Executing command: {' '.join(cmd)}")
-        return subprocess.run(cmd).returncode
-    elif sub == 'validate':
-        req = require_keys('validate', cfg, ['quiz','answers'])
-        args = [str(repo_root / 'scripts' / 'quiz' / 'validate_quiz_answers.py'), '--quiz', req['quiz'], '--answers', req['answers']]
-        runner = repo_root / 'scripts' / 'bin' / 'run_venv.sh'
-        cmd = [str(runner), *args] if runner.exists() else [sys.executable, *args]
-        log('info', f"Executing command: {' '.join(cmd)}")
-        return subprocess.run(cmd).returncode
+    elif sub in ('prepare','export','parse','validate'):
+        log('warning', "This repository is build-only now. Use the Quiz-Project for quiz generation and validation.")
+        qp = repo_root / 'Quiz-Project'
+        log('info', f"See: {qp}/README.md (ensure rag_persist points to {repo_root/' .chroma'})")
+        return 2
     else:
         log('error', f"Unknown subcommand: {sub}")
         return 2

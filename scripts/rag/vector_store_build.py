@@ -58,25 +58,28 @@ from typing import List
 
 
 def lazy_import():
-    """Import vector store + splitter using new package names with fallback."""
+    """Import vector store + splitter using Haystack components."""
     try:
-        from langchain_chroma import Chroma  # type: ignore
-    except Exception:
-        from langchain_community.vectorstores import Chroma  # type: ignore
-    from langchain.docstore.document import Document  # type: ignore
-    from langchain_text_splitters import RecursiveCharacterTextSplitter  # type: ignore
-    return Chroma, Document, RecursiveCharacterTextSplitter
+        from haystack_integrations.document_stores.chroma import ChromaDocumentStore  # type: ignore
+        from haystack import Document  # type: ignore
+        from haystack.components.preprocessors import DocumentSplitter  # type: ignore
+        return ChromaDocumentStore, Document, DocumentSplitter
+    except ImportError as e:
+        raise RuntimeError(f'Haystack modules missing ({e}); install haystack-ai and chroma-haystack.')
 
 def embedding_fn(local: bool, model: str):
     if local:
         try:
-            from langchain_huggingface import HuggingFaceEmbeddings  # type: ignore
-        except Exception:
-            from langchain_community.embeddings import HuggingFaceEmbeddings  # type: ignore
-        return HuggingFaceEmbeddings(model_name=model or 'sentence-transformers/all-MiniLM-L6-v2')
+            from haystack.components.embedders import SentenceTransformersDocumentEmbedder  # type: ignore
+            return SentenceTransformersDocumentEmbedder(model=model or 'sentence-transformers/all-MiniLM-L6-v2')
+        except ImportError:
+            raise RuntimeError('SentenceTransformersDocumentEmbedder not available; install haystack-ai.')
     else:
-        from langchain_openai import OpenAIEmbeddings  # type: ignore
-        return OpenAIEmbeddings(model=model or 'text-embedding-3-small')
+        try:
+            from haystack.components.embedders import OpenAIDocumentEmbedder  # type: ignore
+            return OpenAIDocumentEmbedder(model=model or 'text-embedding-3-small')
+        except ImportError:
+            raise RuntimeError('OpenAIDocumentEmbedder not available; install haystack-ai.')
 
 TAG_TOKEN_RE = re.compile(r'[^a-z0-9]+')
 
@@ -111,7 +114,7 @@ def build(args):
     """
     Download the PDF bundle, extract documents, embed and persist for the RAG-Workflow.
     """
-    Chroma, Document, TextSplitter = lazy_import()
+    ChromaDocumentStore, Document, DocumentSplitter = lazy_import()
 
     # Determine persistence directory and chunk settings
     persist_dir = Path(args.persist)
@@ -210,7 +213,7 @@ def build(args):
                 'tags': ','.join(keywords),
                 'h1': h1
             }
-            docs.append(Document(page_content=text, metadata=meta))
+            docs.append(Document(content=text, meta=meta))
 
         print(f'PDF processing complete. {len(docs)} documents prepared for embedding.')
 
@@ -219,9 +222,10 @@ def build(args):
             return 1
 
         # Use size-based splitting since PDFs lack section headings
-        splitter = TextSplitter(chunk_size=args.chunk_size, chunk_overlap=args.chunk_overlap)
-        splits = splitter.split_documents(docs)
-        avg_len = sum(len(s.page_content) for s in splits) // max(len(splits), 1)
+        splitter = DocumentSplitter(split_by="sentence", split_length=args.chunk_size, split_overlap=args.chunk_overlap)
+        splitter.warm_up()
+        splits = splitter.run(documents=docs)["documents"]
+        avg_len = sum(len(s.content) for s in splits) // max(len(splits), 1)
         print(f'Generated {len(splits)} chunks (avg ~{avg_len} chars).')
 
         # Enforce embedding mode and secrets
@@ -229,14 +233,60 @@ def build(args):
             print('ERROR: --openai selected but OPENAI_API_KEY is not set.')
             return 1
 
-        # Initialize embeddings and persist to Chroma
-        emb = embedding_fn(args.local, args.model)
+        # Initialize document store and embeddings
+        document_store = ChromaDocumentStore(persist_path=str(persist_dir))
+        embedder = embedding_fn(args.local, args.model)
+        embedder.warm_up()
+        
         print('Embedding & persisting to Chroma...')
-        vs = Chroma.from_documents(splits, embedding=emb, persist_directory=args.persist)
-        try:
-            vs.persist()
-        except Exception:
-            pass
+        
+        # Embed and write documents
+        embedded_docs = embedder.run(documents=splits)["documents"]
+
+        # Sanitize metadata for Chroma (supports only str, int, float, bool)
+        for d in embedded_docs:
+            meta = dict(d.meta or {})
+            for k in list(meta.keys()):
+                v = meta[k]
+                # Drop splitter internals or coerce when reasonable
+                if k in {
+                    "_split_overlap",
+                    "_split_length",
+                    "_split_id",
+                    "_split_offset_start",
+                    "_split_offset_end",
+                    "_split_parent_id",
+                }:
+                    # Prefer dropping; alternatively, coerce overlap to configured int
+                    if k == "_split_overlap":
+                        try:
+                            # Cast numpy scalars or sequences to int fallback
+                            if hasattr(v, "item"):
+                                meta[k] = int(v.item())
+                            elif isinstance(v, (list, tuple)):
+                                meta[k] = int(args.chunk_overlap)
+                            elif isinstance(v, (str, int, float, bool)):
+                                # keep as-is if already acceptable
+                                pass
+                            else:
+                                meta[k] = int(args.chunk_overlap)
+                        except Exception:
+                            meta.pop(k, None)
+                    else:
+                        meta.pop(k, None)
+                elif not isinstance(v, (str, int, float, bool)):
+                    # Best-effort cast; otherwise drop
+                    try:
+                        if hasattr(v, "item"):
+                            meta[k] = v.item()
+                        else:
+                            meta[k] = str(v)
+                    except Exception:
+                        meta.pop(k, None)
+            d.meta = meta
+
+        document_store.write_documents(embedded_docs)
+        
         print(f'Done. Persist dir: {args.persist}')
         return 0
 

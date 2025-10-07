@@ -1,29 +1,52 @@
-# RAG-Workflow
+# RAG-Workflow (Build-Only)
 
-RAG-Workflow is a pipeline for automated quiz generation from remote PDF documents. It downloads a tar archive of PDFs, processes and chunks the documents, stores them in a vector database (Chroma), and uses large language models (OpenAI, Ollama) to generate question-answer pairs. The resulting quizzes are presented to users via a command-line interface for interactive learning and assessment.
+This repository builds and maintains a local Chroma vector store from a PDF bundle. It downloads the bundle, extracts and preprocesses documents, splits into chunks, embeds with either local or OpenAI embeddings, and persists to `.chroma/`.
 
-## Workflow Overview
+Quiz generation has been moved to a separate project. Use the sibling `Quiz-Project` to generate quizzes using this vector store.
 
-```mermaid
-flowchart TD
-	A[Download remote tar file with PDFs] --> B[Extract and load PDFs]
-	B --> C[Chunk PDFs]
-	C --> D[Store chunks in Vector Database]
-	D --> E[Script: Generate requests to LLM]
-	E --> F[LLM returns Q&A JSON]
-	F --> G[Command prompt: Challenge users with questions]
+## What this repo does
+
+- Download and extract a PDF bundle
+- Split text into chunks and attach metadata
+- Compute embeddings (local HF or OpenAI)
+- Persist embeddings to Chroma at `./.chroma`
+
+## Quick start
+
+1) Ensure Ollama is installed and running if you need the local checks
+
+2) Build the vector store
+
+```bash
+./scripts/bin/run_venv.sh ./master.py build
 ```
 
-### Steps Explained
+Configuration is read from `params.yaml` under the top-level `build` section. Dependencies are managed from the root `requirements.txt`.
 
-1. **Download remote tar file with PDFs**: Retrieve a compressed archive containing multiple PDF documents from a remote source.
-2. **Extract and load PDFs**: Unpack the tar file and prepare the PDFs for processing.
-3. **Chunk PDFs**: Split the PDFs into manageable text chunks for embedding and retrieval.
-4. **Store chunks in Vector Database (Chroma)**: Embed the chunks and store them in a vector database for efficient similarity search.
-5. **Script: Generate requests to LLM (e.g., OpenAI and Ollama)**: Use a script to send the chunks as prompts to a Large Language Model (LLM) to generate questions and answers.
-6. **LLM returns Q&A JSON**: Collect the responses from the LLM and save them as a JSON file containing questions and answers.
-7. **Command prompt: Challenge users with questions**: Use a command-line interface to present questions to users and evaluate their answers.
+### params.yaml (build section)
 
+```yaml
+build:
+	enabled: true
+	persist: .chroma
+	chunk_size: 40
+	chunk_overlap: 8
+	model: sentence-transformers/all-MiniLM-L6-v2
+	bundle_url: https://github.com/brandon-benge/InterviewPrep/releases/download/latest/pdfs-bundle.tar.gz
+	local: true   # exactly one of local/openai must be true
+	openai: false
+	force: true
+```
 
-For more details on quiz generation, see the [QUIZ_GENERATION.md](QUIZ_GENERATION.md) file.
+## Quiz generation (moved)
+
+Use `Quiz-Project` in this repo's root for quiz workflows.
+
+```bash
+cd Quiz-Project
+./scripts/bin/run_venv.sh
+./master.py prepare  # uses ../.chroma by default
+```
+
+If you move `Quiz-Project`, update its `quiz.params` (rag_persist) to point to this repo's `./.chroma` directory.
 

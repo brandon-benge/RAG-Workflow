@@ -1,0 +1,35 @@
+# RAG Workflow Configuration
+# This file contains global configuration settings for the RAG workflow
+
+# Virtual Environment Configuration
+venv:
+  # Path to the virtual environment directory (relative to project root or absolute)
+  path: "../venv"
+  # Python executable to use when creating the virtual environment
+  python_executable: "python3"
+
+# Requirements Configuration
+requirements:
+  # Dependency file (kept at repo root)
+  primary: "requirements.txt"
+  # Optional fallback (defaults to same root requirements.txt)
+  fallback: "requirements.txt"
+
+# Logging Configuration
+logging:
+  # Enable/disable timestamp in log messages
+  timestamps: true
+  # Log level (debug, info, warning, error)
+  level: "info"
+
+# Vector Store Build Configuration (migrated from quiz.params)
+build:
+  enabled: true
+  persist: "../.chroma"
+  chunk_size: 40
+  chunk_overlap: 8
+  model: "sentence-transformers/all-MiniLM-L6-v2"
+  bundle_url: "https://github.com/brandon-benge/InterviewPrep/releases/download/latest/pdfs-bundle.tar.gz"
+  local: true
+  openai: false
+  force: true
