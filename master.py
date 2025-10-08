@@ -90,6 +90,8 @@ def get_build(cfg: Dict[str, Any]) -> Dict[str, Any]:
         out['chunk_overlap'] = str(b.get('chunk_overlap'))
     if 'max_tokens_per_chunk' in b:
         out['max_tokens_per_chunk'] = int(b.get('max_tokens_per_chunk'))
+    # Optional: persist each model under a unique subfolder
+    out['persist_by_model'] = bool(str(b.get('persist_by_model','false')).lower() in ('1','true','yes','y'))
     # Optional TF-IDF keywords per doc
     if 'tfidf_top_n' in b:
         try:
@@ -177,6 +179,8 @@ def dispatch(argv: List[str]) -> Optional[int]:
                 build_args += ['--max-tokens-per-chunk', str(bvals['max_tokens_per_chunk'])]
             if 'tfidf_top_n' in bvals:
                 build_args += ['--tfidf-top-n', str(bvals['tfidf_top_n'])]
+            if bvals.get('persist_by_model'):
+                build_args += ['--persist-by-model']
             cmd = [str(runner), *build_args] if runner.exists() else [sys.executable, *build_args]
             log('info', f"Executing command: {' '.join(cmd)}")
             rc = subprocess.run(cmd).returncode

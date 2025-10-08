@@ -103,6 +103,12 @@ def build(args):
 
     # Determine persistence directory and chunk settings
     persist_dir = Path(args.persist)
+    if getattr(args, 'persist_by_model', False):
+        # Create a filesystem-safe slug from the model name
+        # Lowercase, replace non-alphanumerics with '-', and collapse repeats
+        raw = str(args.model)
+        slug = re.sub(r'[^a-zA-Z0-9]+', '-', raw).strip('-').lower()
+        persist_dir = persist_dir / slug
 
     # Clean up existing persistence directory if --force is set
     if args.force and persist_dir.exists():
@@ -267,7 +273,7 @@ def build(args):
 
         document_store.write_documents(embedded_docs)
 
-        print(f'Done. Persist dir: {args.persist}')
+        print(f'Done. Persist dir: {persist_dir}')
         return 0
 
 def parse(argv):
@@ -284,6 +290,7 @@ def parse(argv):
     group.add_argument('--local', action='store_true', help='Use local HuggingFace embedding model (required choice)')
     group.add_argument('--openai', action='store_true', help='Use OpenAI embeddings (required choice)')
     ap.add_argument('--force', action='store_true', help='Rebuild even if directory exists')
+    ap.add_argument('--persist-by-model', action='store_true', help='Persist under a model-derived subfolder')
     return ap.parse_args(argv)
 
 if __name__ == '__main__':

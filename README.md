@@ -6,16 +6,37 @@ Quiz generation has been moved to a separate project. Use the sibling `Quiz-Proj
 
 ## What this repo does
 
-- Download and extract a PDF bundle
-- Split text into chunks and attach metadata
-- Compute embeddings (local HF or OpenAI)
-- Persist embeddings to Chroma at `./.chroma`
+- Download and extract a PDF bundle.
+- Split text into chunks and attach metadata.
+- Compute embeddings (local HF or OpenAI).
+- Persist embeddings to Chroma at `./.chroma`.
+
+---
+
+## Vector Store Architecture Overview
+
+```mermaid
+flowchart TD
+    A[📦 PDF Bundle Download] --> B[🧩 Document Extraction & Cleaning]
+    B --> C[✂️ Chunking by Sentence / Line / Passage]
+    C --> D[🔠 Text Embedding Generation]
+    D -->|Local| E1[🧠 SentenceTransformers Model]
+    D -->|Cloud| E2[☁️ OpenAI Embedding API]
+    E1 --> F[💾 Store Embeddings + Metadata]
+    E2 --> F
+    F --> G[📚 Persist to .chroma/]
+    G --> H[🔍 Queryable Vector Index Ready]
+```
+
+This diagram shows how raw PDFs become searchable embeddings stored locally in Chroma.
+
+---
 
 ## Quick start
 
-1) Ensure Ollama is installed and running if you need the local checks
+1) Ensure Ollama is installed and running if you need the local checks.
 
-2) Build the vector store
+2) Build the vector store:
 
 ```bash
 ./scripts/bin/run_venv.sh ./master.py build
@@ -31,40 +52,40 @@ build:
   persist: .chroma
 
   # How to split documents before embedding:
-  # sentence  - best general-purpose; coherent chunks for QA and retrieval
-  # word      - very fine-grained windows; entities/short phrases; larger N, lower coherence
-  # line      - structured text where newlines matter (code, logs, tables, markdown lists)
-  # passage   - paragraph/section level; preserves local context; configurable size/overlap
-  # page      - page-per-chunk (slides/forms); forces size/overlap to 1/0
-  # document  - whole file; only when docs are tiny or indexed elsewhere; forces 1/0
+  # sentence  - best general-purpose; coherent chunks for QA and retrieval.
+  # word      - very fine-grained windows; entities/short phrases; larger N, lower coherence.
+  # line      - structured text where newlines matter (code, logs, tables, markdown lists).
+  # passage   - paragraph/section level; preserves local context; configurable size/overlap.
+  # page      - page-per-chunk (slides/forms); forces size/overlap to 1/0.
+  # document  - whole file; only when docs are tiny or indexed elsewhere; forces 1/0.
   split_by: sentence
 
   # chunk_size/chunk_overlap are optional; auto-tuned per split_by if omitted.
-  # Typical defaults -> word:(200,40), sentence:(6,1), line:(50,10), page/document:(1,0)
+  # Typical defaults -> word:(200,40), sentence:(6,1), line:(50,10), page/document:(1,0).
   # chunk_size: 6
   # chunk_overlap: 1
 
   # Embedding model (see guidance below). Changing models requires a rebuild (set force: true).
   model: sentence-transformers/all-MiniLM-L6-v2
 
-  # Bundle to index
+  # Bundle to index.
   bundle_url: https://github.com/brandon-benge/InterviewPrep/releases/download/latest/pdfs-bundle.tar.gz
 
-  # Provider: exactly one must be true
+  # Provider: exactly one must be true.
   local: true
   openai: false
 
-  # Rebuild from scratch (wipe .chroma) — recommended when you change model/splitting
+  # Rebuild from scratch (wipe .chroma) — recommended when you change model/splitting.
   force: true
 ```
 
 Split strategies and when to use them:
-- sentence: best general-purpose choice; coherent chunks for QA and retrieval
-- word: sliding windows for very fine-grained lookups (entities, short phrases)
-- line: structured text where newlines are meaningful (code, logs, tables, bullet-heavy markdown)
-- passage: paragraph/section level; configurable; good for preserving local context
-- page: page-per-chunk; great for slide decks or forms; forces size/overlap to 1/0
-- document: whole file; only when docs are tiny or indexing externally; forces size/overlap to 1/0
+- sentence: best general-purpose choice; coherent chunks for QA and retrieval.
+- word: sliding windows for very fine-grained lookups (entities, short phrases).
+- line: structured text where newlines are meaningful (code, logs, tables, bullet-heavy markdown).
+- passage: paragraph/section level; configurable; good for preserving local context.
+- page: page-per-chunk; great for slide decks or forms; forces size/overlap to 1/0.
+- document: whole file; only when docs are tiny or indexing externally; forces size/overlap to 1/0.
 
 The builder reports the average tokens per chunk when possible (falls back to characters if tokenization isn’t available).
 
@@ -72,16 +93,16 @@ The builder reports the average tokens per chunk when possible (falls back to ch
 
 You do not need to change the model when you change `split_by`, but it can help to align model capacity and domain with chunk length and content.
 
-- Fast local baseline (short/medium chunks, general text)
+- Fast local baseline (short/medium chunks, general text):
   - sentence-transformers/all-MiniLM-L6-v2 (384 dims): very fast, compact index; great default for `sentence` or `line`.
-- Higher quality local (better semantic recall, larger index)
-  - sentence-transformers/all-mpnet-base-v2 (768 dims)
-  - BAAI/bge-base-en-v1.5 (768 dims) or BAAI/bge-large-en-v1.5 (1024 dims)
-- Code/diagrams/logs (line-split, fenced blocks, mermaid, code)
-  - jina-embeddings-v2-base-code (code-oriented; stronger on structured/text-with-code)
-- Cloud (very long chunks, mixed content, strong quality)
-  - OpenAI text-embedding-3-small (1536 dims): lower cost, good quality
-  - OpenAI text-embedding-3-large (3072 dims): highest quality, larger vectors and cost
+- Higher quality local (better semantic recall, larger index):
+  - sentence-transformers/all-mpnet-base-v2 (768 dims).
+  - BAAI/bge-base-en-v1.5 (768 dims) or BAAI/bge-large-en-v1.5 (1024 dims).
+- Code/diagrams/logs (line-split, fenced blocks, mermaid, code):
+  - jina-embeddings-v2-base-code (code-oriented; stronger on structured/text-with-code).
+- Cloud (very long chunks, mixed content, strong quality):
+  - OpenAI text-embedding-3-small (1536 dims): lower cost, good quality.
+  - OpenAI text-embedding-3-large (3072 dims): highest quality, larger vectors and cost.
 
 Guidelines by split strategy:
 - sentence: MiniLM is a great default; use MPNet/BGE for higher quality if index size is acceptable.
