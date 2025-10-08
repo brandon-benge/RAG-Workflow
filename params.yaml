@@ -26,9 +26,47 @@ logging:
 build:
   enabled: true
   persist: "../.chroma"
-  chunk_size: 40
-  chunk_overlap: 8
-  model: "sentence-transformers/all-MiniLM-L6-v2"
+
+  # TF-IDF keyword extraction settings
+  # Number of keywords to tag per PDF (higher may add noise). Typical: 10-30.
+  tfidf_top_n: 20
+  
+  # split_by controls how documents are segmented before embedding.
+  # Types and when to use them:
+  # - sentence: Default. Balanced semantic units for QA and retrieval; preserves meaning.
+  # - word: Fine-grained sliding windows; use when questions target short phrases or entities.
+  # - line: Useful for code-like, tabular, or log-style text where newlines matter.
+  # - passage: Paragraph/section level; preserves local context; larger chunks. Defaults apply but you may override size/overlap.
+  # - page: One page per chunk; good when each page is self-contained (e.g., slides, forms). Size/overlap forced to 1/0.
+  # - document: Whole file as a single chunk; only for very small docs or when using external text indexing. Size/overlap forced to 1/0.
+  split_by: line
+  # chunk_size and chunk_overlap are optional and auto-configured per split_by if omitted.
+  # Typical defaults:
+  #   word: (200, 40)   sentence: (6, 1)   line: (40, 7)   passage: (1, 0)
+  #   page/document are always (1, 0)
+  # Note: build output logs average tokens per chunk when possible.
+  # Uncomment to override the defaults for word/sentence/line modes.
+  # chunk_size: 40
+  # chunk_overlap: 8
+  
+  # Optional: cap tokens per chunk; if omitted, the builder derives a cap by model
+  #   - Local HF models: defaults to tokenizer.model_max_length (often ~512)
+  #   - OpenAI (tiktoken): defaults to ~8192 tokens for text-embedding-3 models
+  # max_tokens_per_chunk: 512
+
+  model: "BAAI/bge-base-en-v1.5"
+  # Model guidance by split_by (non-enforcing):
+  # - sentence: sentence-transformers/all-MiniLM-L6-v2 (fast, 384d) is a solid default.
+  #   For higher accuracy, consider all-mpnet-base-v2 or BAAI/bge-base-en-v1.5 (768d).
+  # - line: for natural text, same as sentence. For code/logs/tables, consider a code-focused
+  #   embedder (e.g., jina-embeddings-v2-base-code or other code-oriented models).
+  # - passage: multi-sentence chunks benefit from stronger models (mpnet/bge). Keep chunks
+  #   under the model's tokenizer limit (~512 tokens for many local models) to avoid truncation.
+  # - page/document: chunks can exceed local model limits; consider OpenAI embeddings
+  #   (text-embedding-3-small/large) for larger context windows if using long chunks.
+  # Notes: larger vector dimensions improve recall but increase index size; switching models
+  # requires a rebuild of the vector store.
+
   bundle_url: "https://github.com/brandon-benge/InterviewPrep/releases/download/latest/pdfs-bundle.tar.gz"
   local: true
   openai: false

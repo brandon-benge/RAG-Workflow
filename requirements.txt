@@ -8,3 +8,4 @@ chroma-haystack>=0.18.0
 sentence-transformers>=2.7.0
 nltk>=3.9.1
 PyYAML>=6.0.0
+tiktoken

@@ -1,26 +1,6 @@
+#!/usr/bin/env python3
 from __future__ import annotations
 import os
-
-def extract_keywords_tfidf(texts: list[str], top_n: int = 20) -> list[list[str]]:
-    """Extract top N keywords per document using TF‑IDF. If scikit‑learn is not
-    available in the environment, fail."""
-    try:
-        from sklearn.feature_extraction.text import TfidfVectorizer  # type: ignore
-    except Exception:
-        raise RuntimeError('scikit-learn is required for TF-IDF keyword tagging; install scikit-learn and re-run.')
-
-    vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
-    tfidf_matrix = vectorizer.fit_transform(texts)
-    feature_names = vectorizer.get_feature_names_out()
-    keywords_per_doc: list[list[str]] = []
-    for doc_idx in range(tfidf_matrix.shape[0]):
-        row = tfidf_matrix.getrow(doc_idx)
-        # get indices of top_n tf-idf scores (descending)
-        top_indices = row.toarray()[0].argsort()[-top_n:][::-1]
-        keywords = [feature_names[i] for i in top_indices if row[0, i] > 0]
-        keywords_per_doc.append(keywords)
-    return keywords_per_doc
-#!/usr/bin/env python3
 """
 Build a local Chroma vector store from a released PDF bundle for the RAG-Workflow project.
 
@@ -51,10 +31,15 @@ import shutil
 import re
 import tarfile
 import urllib.request
+from urllib.parse import urlparse, unquote
 import tempfile
 import subprocess
 from pathlib import Path
 from typing import List
+from .build_utils import download_bundle, safe_extract, ensure_pdftotext
+from .pdf_pipeline import extract_pdf_texts, extract_keywords_tfidf
+from .split_pipeline import config_split_params, build_tokenizer, count_tokens_and_log, auto_cap
+from .embed_pipeline import get_embedder, write_embeddings
 
 
 def lazy_import():
@@ -129,12 +114,15 @@ def build(args):
     # Temporary directory for extraction
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
-        tar_path = tmp_path / 'pdfs-bundle.tar.gz'
+        # Derive the output filename from the URL path (fallback to a generic name)
+        parsed = urlparse(pdf_url)
+        fname = Path(unquote(parsed.path)).name or 'bundle.tar.gz'
+        tar_path = tmp_path / fname
 
         # Always download the bundle; do not use any local tarball.
         print(f'Downloading PDF bundle from {pdf_url}...')
         try:
-            urllib.request.urlretrieve(pdf_url, tar_path)
+            download_bundle(pdf_url, tar_path)
         except Exception as e:
             print(f'ERROR: failed to download PDF bundle: {e}')
             return 1
@@ -142,8 +130,7 @@ def build(args):
         # Extract the tarball with a safe filter to avoid future deprecation warnings
         print('Extracting PDF bundle...')
         try:
-            with tarfile.open(tar_path, 'r:gz') as tf:
-                tf.extractall(tmp_path, filter='data')
+            safe_extract(tar_path, tmp_path)
         except Exception as e:
             print(f'ERROR: failed to extract PDF bundle: {e}')
             return 1
@@ -157,10 +144,10 @@ def build(args):
         print(f'Found {len(pdf_paths)} PDF files. Parsing content...')
 
         # Ensure the pdftotext command is available before attempting to parse PDFs
-        if shutil.which('pdftotext') is None:
-            print("ERROR: 'pdftotext' command not found on your system.")
-            print("Please install poppler-utils (e.g. `brew install poppler` on macOS) "
-                  "or ensure that the 'pdftotext' binary is in your PATH.")
+        try:
+            ensure_pdftotext()
+        except Exception as e:
+            print(f"ERROR: {e}")
             return 1
 
         docs = []
@@ -168,38 +155,20 @@ def build(args):
         pdf_h1s = []
         pdf_paths_for_meta = []
 
-        for pdf_path in pdf_paths:
-            try:
-                result = subprocess.run(
-                    ['pdftotext', str(pdf_path), '-'],
-                    capture_output=True,
-                    text=True,
-                    check=True
-                )
-            except Exception as e:
-                print(f'WARN: failed to extract text from {pdf_path}: {e}')
-                continue
-
-            text = result.stdout or ''
-            lines = [line.strip() for line in text.splitlines() if line.strip()]
-            if not lines:
-                continue
-            first_line = lines[0]
-            if first_line.lower().startswith('contents') and len(lines) > 1:
-                h1 = lines[1]
-            else:
-                h1 = first_line
-
-            pdf_texts.append(text)
-            pdf_h1s.append(h1)
-            pdf_paths_for_meta.append(pdf_path)
+        texts, h1s, kept_paths = extract_pdf_texts(pdf_paths)
+        pdf_texts.extend(texts)
+        pdf_h1s.extend(h1s)
+        pdf_paths_for_meta.extend(kept_paths)
 
         # Extract keywords for each PDF using TF-IDF (fail if unavailable or empty)
         if not pdf_texts:
             print('ERROR: No extracted text to tag from PDFs.')
             return 1
         try:
-            keywords_lists = extract_keywords_tfidf(pdf_texts, top_n=20)
+            top_n = getattr(args, 'tfidf_top_n', None)
+            if top_n is None:
+                top_n = 20
+            keywords_lists = extract_keywords_tfidf(pdf_texts, top_n=top_n)
         except Exception as e:
             print(f'ERROR: keyword extraction failed: {e}')
             return 1
@@ -221,12 +190,27 @@ def build(args):
             print('No valid PDF documents to embed.')
             return 1
 
-        # Use size-based splitting since PDFs lack section headings
-        splitter = DocumentSplitter(split_by="sentence", split_length=args.chunk_size, split_overlap=args.chunk_overlap)
+        # Configure splitting based on split_by with sensible defaults
+        split_by = getattr(args, 'split_by', 'sentence')
+        split_by, split_length, split_overlap = config_split_params(
+            split_by, getattr(args, 'chunk_size', None), getattr(args, 'chunk_overlap', None)
+        )
+
+        print(f"Splitting by '{split_by}' with length={split_length}, overlap={split_overlap} ...")
+        # Persist resolved values back to args for downstream references
+        args.chunk_size = split_length
+        args.chunk_overlap = split_overlap
+        splitter = DocumentSplitter(split_by=split_by, split_length=split_length, split_overlap=split_overlap)
         splitter.warm_up()
         splits = splitter.run(documents=docs)["documents"]
-        avg_len = sum(len(s.content) for s in splits) // max(len(splits), 1)
-        print(f'Generated {len(splits)} chunks (avg ~{avg_len} chars).')
+        tokenizer, tokenizer_type = build_tokenizer(args.local, args.model)
+        if tokenizer is not None:
+            splits, limit, tok_counts, avg_tokens = count_tokens_and_log(splits, tokenizer, tokenizer_type)
+            cap = getattr(args, 'max_tokens_per_chunk', None)
+            splits, applied_cap = auto_cap(args.local, tokenizer, tokenizer_type, tok_counts, splits, cap)
+        else:
+            avg_len = sum(len(s.content or '') for s in splits) // max(len(splits), 1)
+            print(f"Generated {len(splits)} chunks (avg ~{avg_len} chars).")
 
         # Enforce embedding mode and secrets
         if args.openai and not os.environ.get('OPENAI_API_KEY'):
@@ -235,13 +219,9 @@ def build(args):
 
         # Initialize document store and embeddings
         document_store = ChromaDocumentStore(persist_path=str(persist_dir))
-        embedder = embedding_fn(args.local, args.model)
-        embedder.warm_up()
-        
+        embedder = get_embedder(args.local, args.model)
         print('Embedding & persisting to Chroma...')
-        
-        # Embed and write documents
-        embedded_docs = embedder.run(documents=splits)["documents"]
+        embedded_docs = write_embeddings(document_store, embedder, splits)
 
         # Sanitize metadata for Chroma (supports only str, int, float, bool)
         for d in embedded_docs:
@@ -286,17 +266,20 @@ def build(args):
             d.meta = meta
 
         document_store.write_documents(embedded_docs)
-        
+
         print(f'Done. Persist dir: {args.persist}')
         return 0
 
 def parse(argv):
     ap = argparse.ArgumentParser()
     ap.add_argument('--persist', required=True, help='Persistence directory (required)')
-    ap.add_argument('--chunk-size', type=int, required=True, help='Chunk size (required)')
-    ap.add_argument('--chunk-overlap', type=int, required=True, help='Chunk overlap (required)')
+    ap.add_argument('--split-by', choices=['word','sentence','line','passage','page','document'], default='sentence', help='Unit to split by')
+    ap.add_argument('--chunk-size', type=int, help='Chunk size (auto if omitted, depends on split_by)')
+    ap.add_argument('--chunk-overlap', type=int, help='Chunk overlap (auto if omitted, depends on split_by)')
+    ap.add_argument('--max-tokens-per-chunk', type=int, help='Optional token cap per chunk; auto-derived from model if omitted')
     ap.add_argument('--model', required=True, help='Embedding model name (required)')
     ap.add_argument('--bundle-url', required=True, help='Download this tar.gz bundle of PDFs (required)')
+    ap.add_argument('--tfidf-top-n', type=int, help='Number of TF-IDF keywords to extract per PDF (default 20)')
     group = ap.add_mutually_exclusive_group(required=True)
     group.add_argument('--local', action='store_true', help='Use local HuggingFace embedding model (required choice)')
     group.add_argument('--openai', action='store_true', help='Use OpenAI embeddings (required choice)')

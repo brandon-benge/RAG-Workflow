@@ -9,3 +9,4 @@ patch.diff
 ./*.txt
 ./*.json
 .chroma/chroma.sqlite3
+__pycache__

@@ -70,7 +70,8 @@ def get_build(cfg: Dict[str, Any]) -> Dict[str, Any]:
         log('error', "Missing 'build' section in params.yaml")
         sys.exit(1)
     b = cfg['build'] or {}
-    must = ['persist','chunk_size','chunk_overlap','model','bundle_url']
+    # Required keys; chunk size/overlap are optional now (auto-configured by split_by)
+    must = ['persist','model','bundle_url']
     out = {}
     for k in must:
         if k not in b:
@@ -81,6 +82,20 @@ def get_build(cfg: Dict[str, Any]) -> Dict[str, Any]:
     out['local'] = bool(str(b.get('local','true')).lower() in ('1','true','yes','y'))
     out['openai'] = bool(str(b.get('openai','false')).lower() in ('1','true','yes','y'))
     out['force'] = bool(str(b.get('force','false')).lower() in ('1','true','yes','y'))
+    # Optional split controls
+    out['split_by'] = str(b.get('split_by', 'sentence'))
+    if 'chunk_size' in b:
+        out['chunk_size'] = str(b.get('chunk_size'))
+    if 'chunk_overlap' in b:
+        out['chunk_overlap'] = str(b.get('chunk_overlap'))
+    if 'max_tokens_per_chunk' in b:
+        out['max_tokens_per_chunk'] = int(b.get('max_tokens_per_chunk'))
+    # Optional TF-IDF keywords per doc
+    if 'tfidf_top_n' in b:
+        try:
+            out['tfidf_top_n'] = int(b.get('tfidf_top_n'))
+        except Exception:
+            out['tfidf_top_n'] = 20
     return out
 
 # Bool parser
@@ -111,23 +126,7 @@ def dispatch(argv: List[str]) -> Optional[int]:
         if 'build' in cfg and isinstance(cfg['build'], dict):
             b_enabled = bool(str(cfg['build'].get('enabled','true')).lower() in ('1','true','yes','y'))
         if b_enabled:
-            # --- Ollama preflight check ---
-            ollama_check = repo_root / 'scripts' / 'rag' / 'check_ollama.py'
             runner = repo_root / 'scripts' / 'bin' / 'run_venv.sh'
-            log('info', 'Checking if Ollama is running...')
-            check_cmd = [str(runner), str(ollama_check), 'check'] if runner.exists() else [sys.executable, str(ollama_check), 'check']
-            check_result = subprocess.run(check_cmd)
-            if check_result.returncode != 0:
-                log('warning', 'Ollama is not running. Attempting to start Ollama...')
-                start_cmd = [str(runner), str(ollama_check), 'start'] if runner.exists() else [sys.executable, str(ollama_check), 'start']
-                start_result = subprocess.run(start_cmd)
-                if start_result.returncode != 0:
-                    log('error', 'Failed to start Ollama. Please start it manually and retry.')
-                    return 1
-                else:
-                    log('info', 'Ollama started successfully.')
-            else:
-                log('info', 'Ollama is already running.')
             # --- Continue with build ---
             build_script = repo_root / 'scripts' / 'rag' / 'vector_store_build.py'
             bvals = get_build(cfg)
@@ -136,7 +135,26 @@ def dispatch(argv: List[str]) -> Optional[int]:
             if b_local == b_openai:
                 log('error', "[build] Exactly one of 'local' or 'openai' must be true")
                 return 1
-            build_args = [str(build_script)]
+            # Only check/start Ollama when using local embeddings
+            if b_local:
+                ollama_check = repo_root / 'scripts' / 'rag' / 'check_ollama.py'
+                log('info', 'Checking if Ollama is running...')
+                check_cmd = [str(runner), str(ollama_check), 'check'] if runner.exists() else [sys.executable, str(ollama_check), 'check']
+                check_result = subprocess.run(check_cmd)
+                if check_result.returncode != 0:
+                    log('warning', 'Ollama is not running. Attempting to start Ollama...')
+                    start_cmd = [str(runner), str(ollama_check), 'start'] if runner.exists() else [sys.executable, str(ollama_check), 'start']
+                    start_result = subprocess.run(start_cmd)
+                    if start_result.returncode != 0:
+                        log('error', 'Failed to start Ollama. Please start it manually and retry.')
+                        return 1
+                    else:
+                        log('info', 'Ollama started successfully.')
+                else:
+                    log('info', 'Ollama is already running.')
+            # Run builder as a module so relative imports work (requires scripts/ and scripts/rag/ to be packages)
+            build_module = 'scripts.rag.vector_store_build'
+            build_args = ['-m', build_module]
             if b_local:
                 build_args.append('--local')
             else:
@@ -145,11 +163,20 @@ def dispatch(argv: List[str]) -> Optional[int]:
                 build_args.append('--force')
             build_args += [
                 '--persist', bvals['persist'],
-                '--chunk-size', bvals['chunk_size'],
-                '--chunk-overlap', bvals['chunk_overlap'],
                 '--model', bvals['model'],
                 '--bundle-url', bvals['bundle_url'],
             ]
+            # Pass split settings
+            if bvals.get('split_by'):
+                build_args += ['--split-by', bvals['split_by']]
+            if 'chunk_size' in bvals:
+                build_args += ['--chunk-size', bvals['chunk_size']]
+            if 'chunk_overlap' in bvals:
+                build_args += ['--chunk-overlap', bvals['chunk_overlap']]
+            if 'max_tokens_per_chunk' in bvals:
+                build_args += ['--max-tokens-per-chunk', str(bvals['max_tokens_per_chunk'])]
+            if 'tfidf_top_n' in bvals:
+                build_args += ['--tfidf-top-n', str(bvals['tfidf_top_n'])]
             cmd = [str(runner), *build_args] if runner.exists() else [sys.executable, *build_args]
             log('info', f"Executing command: {' '.join(cmd)}")
             rc = subprocess.run(cmd).returncode
@@ -159,7 +186,7 @@ def dispatch(argv: List[str]) -> Optional[int]:
     elif sub in ('prepare','export','parse','validate'):
         log('warning', "This repository is build-only now. Use the Quiz-Project for quiz generation and validation.")
         qp = repo_root / 'Quiz-Project'
-        log('info', f"See: {qp}/README.md (ensure rag_persist points to {repo_root/' .chroma'})")
+        log('info', f"See: {qp}/README.md (ensure rag_persist points to {(repo_root / '.chroma')})")
         return 2
     else:
         log('error', f"Unknown subcommand: {sub}")
