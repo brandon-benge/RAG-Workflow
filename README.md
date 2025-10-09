@@ -1,6 +1,6 @@
 # RAG-Workflow (Build-Only)
 
-This repository builds and maintains a local Chroma vector store from a PDF bundle. It downloads the bundle, extracts and preprocesses documents, splits into chunks, embeds with either local or OpenAI embeddings, and persists to `.chroma/`.
+This repository builds and maintains a local Chroma vector store from a PDF bundle. It downloads the bundle, extracts and preprocesses documents, splits into chunks, embeds with local SentenceTransformers via Haystack, and persists to the configured directory in `params.yaml` (defaults to `../.chroma`).
 
 Quiz generation has been moved to a separate project. Use the sibling `Quiz-Project` to generate quizzes using this vector store.
 
@@ -8,24 +8,23 @@ Quiz generation has been moved to a separate project. Use the sibling `Quiz-Proj
 
 - Download and extract a PDF bundle.
 - Split text into chunks and attach metadata.
-- Compute embeddings (local HF or OpenAI).
+- Compute embeddings (local HF via Haystack).
 - Persist embeddings to Chroma at `./.chroma`.
 
 ---
 
-## Vector Store Architecture Overview
+## Vector Store Architecture Overview (Haystack + Chroma)
 
 ```mermaid
+%%{init: {"flowchart": {"htmlLabels": true}} }%%
 flowchart TD
-    A[📦 PDF Bundle Download] --> B[🧩 Document Extraction & Cleaning]
-    B --> C[✂️ Chunking by Sentence / Line / Passage]
-    C --> D[🔠 Text Embedding Generation]
-    D -->|Local| E1[🧠 SentenceTransformers Model]
-    D -->|Cloud| E2[☁️ OpenAI Embedding API]
-    E1 --> F[💾 Store Embeddings + Metadata]
-    E2 --> F
-    F --> G[📚 Persist to .chroma/]
-    G --> H[🔍 Queryable Vector Index Ready]
+  A["📦 PDF Bundle Download"] --> B["🧩 Document Extraction & Cleaning"]
+  B --> C["✂️ Chunking by Sentence / Line / Passage<br/>(Haystack Splitter)"]
+  C --> D["🔠 Text Embedding Generation<br/>(Haystack SentenceTransformers)"]
+  D --> E["🧠 Local Embedding Model"]
+  E --> F["💾 Store Embeddings + Metadata<br/>(Haystack → Chroma)"]
+  F --> G["📚 Persist to persist_dir"]
+  G --> H["🔍 Queryable Vector Index Ready"]
 ```
 
 This diagram shows how raw PDFs become searchable embeddings stored locally in Chroma.
@@ -34,7 +33,9 @@ This diagram shows how raw PDFs become searchable embeddings stored locally in C
 
 ## Quick start
 
-1) Ensure Ollama is installed and running if you need the local checks.
+1) Prerequisites:
+  - Poppler (for `pdftotext`): macOS → `brew install poppler`; Debian/Ubuntu → `sudo apt install poppler-utils`.
+  - Ensure Ollama is installed and running if you want the optional local check to pass (the build will attempt to verify it).
 
 2) Build the vector store:
 
@@ -49,7 +50,9 @@ Configuration is read from `params.yaml` under the top-level `build` section. De
 ```yaml
 build:
   enabled: true
-  persist: .chroma
+  persist: ../.chroma
+  # When true, append a filesystem‑safe model slug to the persist path (e.g., "BAAI/bge-base-en-v1.5" → "baai-bge-base-en-v1-5")
+  persist_by_model: true
 
   # How to split documents before embedding:
   # sentence  - best general-purpose; coherent chunks for QA and retrieval.
@@ -65,18 +68,20 @@ build:
   # chunk_size: 6
   # chunk_overlap: 1
 
-  # Embedding model (see guidance below). Changing models requires a rebuild (set force: true).
+  # Embedding model (via Haystack SentenceTransformers). Changing models requires a rebuild (set force: true).
   model: sentence-transformers/all-MiniLM-L6-v2
 
   # Bundle to index.
   bundle_url: https://github.com/brandon-benge/InterviewPrep/releases/download/latest/pdfs-bundle.tar.gz
 
-  # Provider: exactly one must be true.
+  # Provider: local-only (Haystack + SentenceTransformers)
   local: true
-  openai: false
 
   # Rebuild from scratch (wipe .chroma) — recommended when you change model/splitting.
   force: true
+
+  # Number of TF‑IDF keywords to tag per PDF (used as lightweight tags)
+  tfidf_top_n: 20
 ```
 
 Split strategies and when to use them:
@@ -89,6 +94,16 @@ Split strategies and when to use them:
 
 The builder reports the average tokens per chunk when possible (falls back to characters if tokenization isn’t available).
 
+### Config highlights
+
+- persist and persist_by_model:
+  - persist controls the base directory where Chroma files are stored (default `../.chroma`).
+  - If persist_by_model is true, the final path becomes `persist/<model-slug>` where the slug is derived from the model (e.g., `BAAI/bge-base-en-v1.5` → `baai-bge-base-en-v1-5`).
+- tfidf_top_n:
+  - Number of keywords extracted per PDF using TF‑IDF. Useful as lightweight tags to aid filtering or inspection.
+- max_tokens_per_chunk:
+  - Optional cap per chunk; if omitted, the builder derives a reasonable limit from the model tokenizer (often around ~512 for many local models).
+
 ## Choosing an embedding model (and when to use)
 
 You do not need to change the model when you change `split_by`, but it can help to align model capacity and domain with chunk length and content.
@@ -100,19 +115,17 @@ You do not need to change the model when you change `split_by`, but it can help 
   - BAAI/bge-base-en-v1.5 (768 dims) or BAAI/bge-large-en-v1.5 (1024 dims).
 - Code/diagrams/logs (line-split, fenced blocks, mermaid, code):
   - jina-embeddings-v2-base-code (code-oriented; stronger on structured/text-with-code).
-- Cloud (very long chunks, mixed content, strong quality):
-  - OpenAI text-embedding-3-small (1536 dims): lower cost, good quality.
-  - OpenAI text-embedding-3-large (3072 dims): highest quality, larger vectors and cost.
+  
 
 Guidelines by split strategy:
 - sentence: MiniLM is a great default; use MPNet/BGE for higher quality if index size is acceptable.
 - line: for natural prose, same as sentence; for code/log-style data (including mermaid), prefer a code-focused model.
-- passage: favor MPNet/BGE; keep chunks under ~512 tokens for most local models or consider OpenAI for longer paragraphs.
-- page/document: local models will truncate if content is long; prefer OpenAI embeddings or reduce chunk size.
+- passage: favor MPNet/BGE; keep chunks under ~512 tokens for most local models; reduce chunk size for longer paragraphs.
+- page/document: local models will truncate if content is long; reduce chunk size.
 
 Other considerations:
 - Vector size vs performance: larger dimensions improve recall but increase storage and query latency.
-- Token limits and truncation: many local models effectively cap around ~512 tokens; OpenAI supports much longer inputs.
+- Token limits and truncation: many local models effectively cap around ~512 tokens.
 - Multilingual: consider multilingual-capable models (e.g., bge-m3, paraphrase-multilingual-mpnet-base-v2) if needed.
 - Rebuild required on change: switching models or splitting strategies should be followed by a fresh build (`force: true`).
 
@@ -124,8 +137,5 @@ split_by: sentence
 # passage-level, higher quality:
 # model: sentence-transformers/all-mpnet-base-v2
 # split_by: passage
-# page-level with long inputs (cloud):
-# model: text-embedding-3-large
-# local: false
-# openai: true
+# page-level: reduce chunk size to avoid truncation
 ```

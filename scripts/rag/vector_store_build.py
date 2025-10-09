@@ -52,19 +52,12 @@ def lazy_import():
     except ImportError as e:
         raise RuntimeError(f'Haystack modules missing ({e}); install haystack-ai and chroma-haystack.')
 
-def embedding_fn(local: bool, model: str):
-    if local:
-        try:
-            from haystack.components.embedders import SentenceTransformersDocumentEmbedder  # type: ignore
-            return SentenceTransformersDocumentEmbedder(model=model or 'sentence-transformers/all-MiniLM-L6-v2')
-        except ImportError:
-            raise RuntimeError('SentenceTransformersDocumentEmbedder not available; install haystack-ai.')
-    else:
-        try:
-            from haystack.components.embedders import OpenAIDocumentEmbedder  # type: ignore
-            return OpenAIDocumentEmbedder(model=model or 'text-embedding-3-small')
-        except ImportError:
-            raise RuntimeError('OpenAIDocumentEmbedder not available; install haystack-ai.')
+def embedding_fn(model: str):
+    try:
+        from haystack.components.embedders import SentenceTransformersDocumentEmbedder  # type: ignore
+        return SentenceTransformersDocumentEmbedder(model=model or 'sentence-transformers/all-MiniLM-L6-v2')
+    except ImportError:
+        raise RuntimeError('SentenceTransformersDocumentEmbedder not available; install haystack-ai.')
 
 TAG_TOKEN_RE = re.compile(r'[^a-z0-9]+')
 
@@ -209,23 +202,18 @@ def build(args):
         splitter = DocumentSplitter(split_by=split_by, split_length=split_length, split_overlap=split_overlap)
         splitter.warm_up()
         splits = splitter.run(documents=docs)["documents"]
-        tokenizer, tokenizer_type = build_tokenizer(args.local, args.model)
+        tokenizer, tokenizer_type = build_tokenizer(True, args.model)
         if tokenizer is not None:
             splits, limit, tok_counts, avg_tokens = count_tokens_and_log(splits, tokenizer, tokenizer_type)
             cap = getattr(args, 'max_tokens_per_chunk', None)
-            splits, applied_cap = auto_cap(args.local, tokenizer, tokenizer_type, tok_counts, splits, cap)
+            splits, applied_cap = auto_cap(True, tokenizer, tokenizer_type, tok_counts, splits, cap)
         else:
             avg_len = sum(len(s.content or '') for s in splits) // max(len(splits), 1)
             print(f"Generated {len(splits)} chunks (avg ~{avg_len} chars).")
 
-        # Enforce embedding mode and secrets
-        if args.openai and not os.environ.get('OPENAI_API_KEY'):
-            print('ERROR: --openai selected but OPENAI_API_KEY is not set.')
-            return 1
-
         # Initialize document store and embeddings
         document_store = ChromaDocumentStore(persist_path=str(persist_dir))
-        embedder = get_embedder(args.local, args.model)
+        embedder = get_embedder(args.model)
         print('Embedding & persisting to Chroma...')
         embedded_docs = write_embeddings(document_store, embedder, splits)
 
@@ -286,9 +274,7 @@ def parse(argv):
     ap.add_argument('--model', required=True, help='Embedding model name (required)')
     ap.add_argument('--bundle-url', required=True, help='Download this tar.gz bundle of PDFs (required)')
     ap.add_argument('--tfidf-top-n', type=int, help='Number of TF-IDF keywords to extract per PDF (default 20)')
-    group = ap.add_mutually_exclusive_group(required=True)
-    group.add_argument('--local', action='store_true', help='Use local HuggingFace embedding model (required choice)')
-    group.add_argument('--openai', action='store_true', help='Use OpenAI embeddings (required choice)')
+    # Local-only embeddings
     ap.add_argument('--force', action='store_true', help='Rebuild even if directory exists')
     ap.add_argument('--persist-by-model', action='store_true', help='Persist under a model-derived subfolder')
     return ap.parse_args(argv)

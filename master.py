@@ -79,8 +79,8 @@ def get_build(cfg: Dict[str, Any]) -> Dict[str, Any]:
             sys.exit(1)
         out[k] = str(b[k])
         log('info', f"build[{k}] = {out[k]}")
-    out['local'] = bool(str(b.get('local','true')).lower() in ('1','true','yes','y'))
-    out['openai'] = bool(str(b.get('openai','false')).lower() in ('1','true','yes','y'))
+    # Local-only mode now; provider flags removed
+    out['local'] = True
     out['force'] = bool(str(b.get('force','false')).lower() in ('1','true','yes','y'))
     # Optional split controls
     out['split_by'] = str(b.get('split_by', 'sentence'))
@@ -132,11 +132,7 @@ def dispatch(argv: List[str]) -> Optional[int]:
             # --- Continue with build ---
             build_script = repo_root / 'scripts' / 'rag' / 'vector_store_build.py'
             bvals = get_build(cfg)
-            b_local = bvals['local']
-            b_openai = bvals['openai']
-            if b_local == b_openai:
-                log('error', "[build] Exactly one of 'local' or 'openai' must be true")
-                return 1
+            b_local = True
             # Only check/start Ollama when using local embeddings
             if b_local:
                 ollama_check = repo_root / 'scripts' / 'rag' / 'check_ollama.py'
@@ -157,10 +153,7 @@ def dispatch(argv: List[str]) -> Optional[int]:
             # Run builder as a module so relative imports work (requires scripts/ and scripts/rag/ to be packages)
             build_module = 'scripts.rag.vector_store_build'
             build_args = ['-m', build_module]
-            if b_local:
-                build_args.append('--local')
-            else:
-                build_args.append('--openai')
+            # Local-only
             if bvals['force']:
                 build_args.append('--force')
             build_args += [

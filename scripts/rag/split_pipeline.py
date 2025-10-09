@@ -28,23 +28,15 @@ def config_split_params(split_by: str, chunk_size: Optional[int], chunk_overlap:
             split_overlap = suggested
     return split_by, split_length, split_overlap
 
-def build_tokenizer(local: bool, model: str):
+def build_tokenizer(_: bool, model: str):
     tokenizer = None
     tokenizer_type = 'none'
-    if local:
-        try:
-            from transformers import AutoTokenizer  # type: ignore
-            tokenizer = AutoTokenizer.from_pretrained(model, use_fast=True)
-            tokenizer_type = 'hf'
-        except Exception:
-            pass
-    else:
-        try:
-            import tiktoken  # type: ignore
-            tokenizer = tiktoken.get_encoding("cl100k_base")
-            tokenizer_type = 'tiktoken'
-        except Exception:
-            pass
+    try:
+        from transformers import AutoTokenizer  # type: ignore
+        tokenizer = AutoTokenizer.from_pretrained(model, use_fast=True)
+        tokenizer_type = 'hf'
+    except Exception:
+        pass
     return tokenizer, tokenizer_type
 
 def count_tokens_and_log(splits, tokenizer, tokenizer_type: str) -> Tuple[List, int, list[int], Optional[int]]:
@@ -96,7 +88,7 @@ def count_tokens_and_log(splits, tokenizer, tokenizer_type: str) -> Tuple[List, 
         print(f"Generated {n} chunks (avg ~{avg_tokens} tokens, p50={p50}, p95={p95}, max={tmax}).")
     return splits, (limit or 0), tok_counts, avg_tokens
 
-def auto_cap(local: bool, tokenizer, tokenizer_type: str, tok_counts: list[int], splits, cap_override: Optional[int] = None):
+def auto_cap(_: bool, tokenizer, tokenizer_type: str, tok_counts: list[int], splits, cap_override: Optional[int] = None):
     # Choose cap
     if cap_override and cap_override > 0:
         cap = cap_override
@@ -109,7 +101,7 @@ def auto_cap(local: bool, tokenizer, tokenizer_type: str, tok_counts: list[int],
             except Exception:
                 cap = 512
         else:
-            cap = 8192
+            cap = 512
     if not cap or cap <= 0:
         return splits, cap
     # Suppress HF verbosity while encoding
