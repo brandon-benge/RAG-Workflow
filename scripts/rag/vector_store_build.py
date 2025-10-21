@@ -26,6 +26,7 @@ is not available.
 """
 
 import argparse
+import json
 import sys
 import shutil
 import re
@@ -176,9 +177,10 @@ def build(args):
             return 1
 
         for text, h1, pdf_path, keywords in zip(pdf_texts, pdf_h1s, pdf_paths_for_meta, keywords_lists):
+            # Store tags as a list of strings (not CSV)
             meta = {
                 'source': str(pdf_path),
-                'tags': ','.join(keywords),
+                'tags': list(keywords or []),
                 'h1': h1
             }
             docs.append(Document(content=text, meta=meta))
@@ -222,6 +224,23 @@ def build(args):
             meta = dict(d.meta or {})
             for k in list(meta.keys()):
                 v = meta[k]
+                # Special handling: preserve tags as a list by flattening into primitive fields
+                if k == 'tags' and isinstance(v, list):
+                    # Keep a JSON representation for round-tripping
+                    try:
+                        meta['tags_json'] = json.dumps([str(x) for x in v])
+                    except Exception:
+                        meta['tags_json'] = json.dumps([])
+                    # Add per-item primitive fields (tags_0, tags_1, ...)
+                    for i, t in enumerate(v):
+                        try:
+                            meta[f'tags_{i}'] = str(t)
+                        except Exception:
+                            continue
+                    meta['tags_len'] = int(len(v))
+                    # Remove original list to satisfy Chroma primitive constraints
+                    meta.pop('tags', None)
+                    continue
                 # Drop splitter internals or coerce when reasonable
                 if k in {
                     "_split_overlap",
@@ -249,9 +268,11 @@ def build(args):
                     else:
                         meta.pop(k, None)
                 elif not isinstance(v, (str, int, float, bool)):
-                    # Best-effort cast; otherwise drop
+                    # For non-primitive types (other than 'tags' handled above), JSON-encode lists; otherwise cast to str
                     try:
-                        if hasattr(v, "item"):
+                        if isinstance(v, list):
+                            meta[k] = json.dumps(v)
+                        elif hasattr(v, "item"):
                             meta[k] = v.item()
                         else:
                             meta[k] = str(v)

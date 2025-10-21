@@ -104,6 +104,30 @@ The builder reports the average tokens per chunk when possible (falls back to ch
 - max_tokens_per_chunk:
   - Optional cap per chunk; if omitted, the builder derives a reasonable limit from the model tokenizer (often around ~512 for many local models).
 
+### Metadata: tags storage
+
+- Internally, tags are computed per PDF using TF‑IDF and attached to each document.
+- To satisfy Chroma’s primitive-only metadata constraint, tags are stored as:
+  - `tags_json`: JSON string of the full list of tags (e.g., '["systems","design",...]').
+  - `tags_len`: Number of tags.
+  - `tags_0`, `tags_1`, …: Individual tag strings for simple filtering or inspection.
+- Reconstructing the list of tags after reading:
+
+```python
+# doc.meta from Chroma/Haystack
+import json
+meta = doc.meta or {}
+tags = []
+if 'tags_json' in meta:
+    try:
+        tags = json.loads(meta['tags_json'])
+    except Exception:
+        tags = []
+else:
+    n = int(meta.get('tags_len', 0) or 0)
+    tags = [meta.get(f'tags_{i}') for i in range(n) if isinstance(meta.get(f'tags_{i}'), str)]
+```
+
 ## Choosing an embedding model (and when to use)
 
 You do not need to change the model when you change `split_by`, but it can help to align model capacity and domain with chunk length and content.
